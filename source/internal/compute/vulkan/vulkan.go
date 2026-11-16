@@ -616,6 +616,7 @@ type Backend struct {
 	// default for headDim 256; SetFlashAttention(false) selects the block
 	// fallback.
 	flashAttention bool
+	vendorID       uint32 // VkPhysicalDeviceProperties.vendorID of the chosen device
 
 	// noPool disables buffer recycling (every Free destroys the buffer). Tests
 	// only.
@@ -916,6 +917,7 @@ func New() (*Backend, error) {
 
 	var chosenProps physicalDeviceProperties
 	vkCall(v.GetPhysicalDeviceProperties, b.physicalDevice, uintptr(unsafe.Pointer(&chosenProps)))
+	b.vendorID = chosenProps.vendorID
 	// timestampPeriod lives in VkPhysicalDeviceLimits, 428 bytes into the
 	// limits area that follows pipelineCacheUUID on 64-bit builds.
 	var timestampPeriod float32 = 1
