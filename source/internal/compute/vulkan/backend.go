@@ -2216,11 +2216,45 @@ func (b *Backend) newZeroF32Buffer(dims ...int) (*buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := b.writeBytes(buf, make([]byte, buf.size)); err != nil {
+	if err := b.zeroFill(buf); err != nil {
 		b.Free(buf)
 		return nil, err
 	}
 	return buf, nil
+}
+
+// zeroFill clears x on the device with vkCmdFillBuffer, recorded into the
+// current batch. Zeroing used to go through writeBytes: a host-side zero slice,
+// a fresh staging buffer and a PCIe copy. In the real 27B training step that
+// was ~26 GB of uploads per step (GatedDeltaNet backward work buffers and the
+// vocab-sized dlogits) and most of the GPU's idle time.
+func (b *Backend) zeroFill(x *buffer) error {
+	if x.size == 0 {
+		return nil
+	}
+	if x.mapped != nil {
+		clear(unsafe.Slice((*byte)(unsafe.Add(x.mapped, x.offset)), x.size))
+		return nil
+	}
+	if b.vk.CmdFillBuffer == 0 {
+		return b.writeBytes(x, make([]byte, x.size))
+	}
+	if err := b.beginBatch(); err != nil {
+		return err
+	}
+	vkCall(b.vk.CmdFillBuffer, b.cmdBuffer, x.buf, uintptr(x.offset), uintptr(x.size&^3), 0)
+	barrier := memoryBarrier{
+		sType:         vkStructureMemoryBarrier,
+		srcAccessMask: vkAccessTransferWrite,
+		dstAccessMask: vkAccessShaderRead | vkAccessShaderWrite,
+	}
+	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageTransfer, vkPipelineStageCompute, 0, 1, uintptr(unsafe.Pointer(&barrier)), 0, 0, 0, 0)
+	return nil
+}
+
+// Zeros returns a zero-filled float32 buffer, cleared on the device.
+func (b *Backend) Zeros(dims ...int) (compute.Buffer, error) {
+	return b.newZeroF32Buffer(dims...)
 }
 
 // GatedDeltaNetBackward implements compute.Backend with the atomic kernel

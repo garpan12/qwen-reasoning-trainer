@@ -97,6 +97,11 @@ func constVec(be compute.Backend, v []float32, T int) (compute.Buffer, error) {
 }
 
 func uploadZeros(be compute.Backend, dims ...int) (compute.Buffer, error) {
+	if z, ok := be.(interface {
+		Zeros(dims ...int) (compute.Buffer, error)
+	}); ok {
+		return z.Zeros(dims...)
+	}
 	n := 1
 	for _, d := range dims {
 		n *= d
