@@ -25,10 +25,14 @@ layout(push_constant) uniform P {
 #include "quant_decode.glsl"
 
 #define TM 64
+#ifndef TN
 #define TN 64
+#endif
 #define TK 16
 #define TKMICRO 4
+#ifndef TNMICRO
 #define TNMICRO 4
+#endif
 
 shared float Ws[TK][TM + 4];
 shared float Ds[TK][TN + 4];

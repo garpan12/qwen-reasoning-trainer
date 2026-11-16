@@ -1,0 +1,8 @@
+#version 450
+// 128-token tile variant: each workgroup covers 128 activation columns, so each
+// dequantized weight element is reused twice as often as in the 64-token tile.
+#define TN 128
+#define TNMICRO 8
+// Fused f16 dequantize + transposed GEMM (dX = W^T dY).
+#define QDECODE(n, kk) deq_f16(n, kk)
+#include "matmul_t_wq_body.glsl"

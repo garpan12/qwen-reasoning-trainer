@@ -460,6 +460,9 @@ func TestVulkanMatMulWeightFusedShapes(t *testing.T) {
 		{256, 65536, 4},
 		{5120, 2000, 16},
 		{6144, 5120, 64},
+		// 128-token GEMM tile: a partial tile, and the training sequence length.
+		{512, 96, 200},
+		{1024, 72, 1024},
 	}
 	types := []quant.Type{
 		quant.TypeQ8_0, quant.TypeQ4_K, quant.TypeQ5_K, quant.TypeQ6_K,
