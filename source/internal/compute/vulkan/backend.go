@@ -204,8 +204,8 @@ func (b *Backend) freeBuffer(x *buffer) {
 	}
 	vkCall(b.vk.DestroyBuffer, b.device, x.buf, 0)
 	vkCall(b.vk.FreeMemory, b.device, x.mem, 0)
-	if b.deviceBytes >= x.size {
-		b.deviceBytes -= x.size
+	if b.deviceBytes >= x.alloc() {
+		b.deviceBytes -= x.alloc()
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"os"
 	"runtime"
 	"strconv"
@@ -640,8 +641,10 @@ type Backend struct {
 	pool         map[poolKey][]*buffer
 	poolBytes    uint64
 	poolCapBytes uint64
-	deviceBytes  uint64
-	peakBytes    uint64
+	// poolExact disables size-class rounding (QWEN38_POOL_CLASSES=0).
+	poolExact   bool
+	deviceBytes uint64
+	peakBytes   uint64
 
 	// scope bounds the lifetime of temporary buffers. Buffers allocated while
 	// a scope is active are logged; EndScope frees the log tail except the
@@ -722,6 +725,10 @@ type buffer struct {
 	// buffer the owning op already released.
 	scopeIdx int
 	size     uint64
+	// capacity is the allocated byte size (>= size). Buffers are allocated in
+	// size classes so the pool can recycle them across slightly different
+	// sizes; descriptors, copies and downloads still use size. 0 means size.
+	capacity uint64
 	// offset is the byte offset of this (possibly shared) view inside the
 	// underlying Vulkan buffer. Descriptors bind at this offset and shaders see
 	// index zero at the view start.
@@ -927,13 +934,22 @@ func New() (*Backend, error) {
 		timestampPeriod = math.Float32frombits(binary.LittleEndian.Uint32(chosenProps.rest[428:432]))
 	}
 	memBytes := b.deviceMemorySize()
-	b.poolCapBytes = memBytes / 8
+	// A quarter of VRAM (up to 16 GiB): the 27B T=1024 training step frees and
+	// reallocates multi-GiB GatedDeltaNet buffers every layer, and the old
+	// 1/8 (max 4 GiB) cap sent most of them back to the driver (~12k
+	// vkFreeMemory/vkAllocateMemory pairs per step). On an L40S this cut the
+	// step 20.6 s -> 17.5 s for +1.4 GiB of peak VRAM.
+	b.poolCapBytes = memBytes / 4
 	if b.poolCapBytes < defaultPoolCap {
 		b.poolCapBytes = defaultPoolCap
 	}
-	if b.poolCapBytes > 4<<30 {
-		b.poolCapBytes = 4 << 30
+	if b.poolCapBytes > 16<<30 {
+		b.poolCapBytes = 16 << 30
 	}
+	if mb := envInt("QWEN38_POOL_CAP_MB", 0); mb > 0 {
+		b.poolCapBytes = uint64(mb) << 20
+	}
+	b.poolExact = os.Getenv("QWEN38_POOL_CLASSES") == "0"
 	b.caps = compute.Capabilities{
 		Name:            "vulkan(" + name + ")",
 		Float32Atomics:  enableAtomics,
@@ -1160,7 +1176,9 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 	if size == 0 {
 		size = 4
 	}
-	if buf, ok := b.poolGet(poolKey{size: size, usage: usage, staging: hostOnly}); ok {
+	capSize := b.sizeClass(size)
+	if buf, ok := b.poolGet(poolKey{size: capSize, usage: usage, staging: hostOnly}); ok {
+		buf.size = size
 		buf.dims = nil
 		buf.typ = quant.TypeF32
 		buf.scopeIdx = -1
@@ -1170,7 +1188,7 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 	b.stats.Allocs++
 	bci := bufferCreateInfo{
 		sType:       vkStructureBufferCreateInfo,
-		size:        size,
+		size:        capSize,
 		usage:       usage,
 		sharingMode: vkSharingModeExclusive,
 	}
@@ -1219,7 +1237,7 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 	hostVisible := b.memProps.memoryTypes[idx].propertyFlags&vkMemoryPropertyHostVisible != 0
 	var mapped unsafe.Pointer
 	if hostVisible {
-		if res := vkCall(b.vk.MapMemory, b.device, mem, 0, uintptr(size), 0, uintptr(unsafe.Pointer(&mapped))); res != vkSuccess {
+		if res := vkCall(b.vk.MapMemory, b.device, mem, 0, uintptr(capSize), 0, uintptr(unsafe.Pointer(&mapped))); res != vkSuccess {
 			vkCall(b.vk.FreeMemory, b.device, mem, 0)
 			vkCall(b.vk.DestroyBuffer, b.device, buf, 0)
 			return nil, fmt.Errorf("vulkan: map memory failed")
@@ -1229,7 +1247,7 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 	if b.deviceBytes > b.peakBytes {
 		b.peakBytes = b.deviceBytes
 	}
-	out := &buffer{b: b, buf: buf, mem: mem, mapped: mapped, hostVisible: hostVisible, usage: usage, staging: hostOnly, scopeIdx: -1, size: size, typ: quant.TypeF32}
+	out := &buffer{b: b, buf: buf, mem: mem, mapped: mapped, hostVisible: hostVisible, usage: usage, staging: hostOnly, scopeIdx: -1, size: size, capacity: capSize, typ: quant.TypeF32}
 	b.trackAlloc(out)
 	return out, nil
 }
@@ -1288,9 +1306,33 @@ func (b *Backend) poolGet(key poolKey) (*buffer, bool) {
 	}
 	buf := list[len(list)-1]
 	b.pool[key] = list[:len(list)-1]
-	b.poolBytes -= buf.size
+	b.poolBytes -= buf.alloc()
 	b.stats.PoolHits++
 	return buf, true
+}
+
+// alloc returns the buffer's allocated byte size.
+func (x *buffer) alloc() uint64 {
+	if x.capacity > x.size {
+		return x.capacity
+	}
+	return x.size
+}
+
+// sizeClass rounds an allocation up so the pool can reuse buffers across the
+// many slightly different temporary sizes of a training step: 16 classes per
+// power of two above 64 KiB (at most 6.25% slack), 256-byte steps below.
+// Exact sizes only matched ~78% of requests and the misses cost a
+// vkAllocateMemory/vkFreeMemory pair each (~2.2 s per 27B T=1024 step).
+func (b *Backend) sizeClass(size uint64) uint64 {
+	if b.poolExact {
+		return size
+	}
+	if size <= 64<<10 {
+		return (size + 255) &^ 255
+	}
+	g := uint64(1) << (bits.Len64(size-1) - 4)
+	return (size + g - 1) / g * g
 }
 
 // poolPut offers a buffer to the pool, returning false if the pool is full.
@@ -1298,15 +1340,15 @@ func (b *Backend) poolPut(buf *buffer) bool {
 	if b.noPool {
 		return false
 	}
-	if b.poolBytes+buf.size > b.poolCapBytes {
+	if b.poolBytes+buf.alloc() > b.poolCapBytes {
 		return false
 	}
 	if b.pool == nil {
 		b.pool = map[poolKey][]*buffer{}
 	}
-	key := poolKey{size: buf.size, usage: buf.usage, staging: buf.staging}
+	key := poolKey{size: buf.alloc(), usage: buf.usage, staging: buf.staging}
 	b.pool[key] = append(b.pool[key], buf)
-	b.poolBytes += buf.size
+	b.poolBytes += buf.alloc()
 	return true
 }
 
