@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"unsafe"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
@@ -2811,6 +2812,20 @@ func (b *Backend) rowGEMVShader(typ quant.Type) (string, bool) {
 	return name, ok
 }
 
+// gemmM128 selects the 128-token-tile fused GEMMs (matmul_wq_m128_*,
+// matmul_t_wq_m128_*) for activations with at least 128 columns. A wider tile
+// halves the per-FLOP cost of dequantizing the weight, which bounds the fused
+// GEMMs. QWEN38_GEMM_M128=0 keeps the 64-token tile.
+var gemmM128 = os.Getenv("QWEN38_GEMM_M128") != "0"
+
+// m128Name maps a fused GEMM shader name to its 128-token-tile variant.
+func m128Name(name string) string {
+	if strings.HasPrefix(name, "matmul_t_wq_") {
+		return "matmul_t_wq_m128_" + strings.TrimPrefix(name, "matmul_t_wq_")
+	}
+	return "matmul_wq_m128_" + strings.TrimPrefix(name, "matmul_wq_")
+}
+
 // gemv computes y = W * x for a single activation column using a fused
 // dequantize+GEMV shader. It returns errNoGemv when the type has no shader.
 func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
@@ -3000,6 +3015,10 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 	if name, ok := matmulWShaders[wb.typ]; ok && !b.noFusedFwd {
 		gx := ceilDiv(uint32(n), 64)
 		gy := ceilDiv(uint32(m), 64)
+		if gemmM128 && m >= 128 {
+			name = m128Name(name)
+			gy = ceilDiv(uint32(m), 128)
+		}
 		if gx <= maxWorkGroups && gy <= maxWorkGroups {
 			out, err := b.newF32Buffer(n, m)
 			if err != nil {
@@ -3110,6 +3129,10 @@ func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, e
 	if name, ok := matmulTWShaders[wb.typ]; ok && !b.noFusedT {
 		gx := ceilDiv(uint32(k), 64)
 		gy := ceilDiv(uint32(m), 64)
+		if gemmM128 && m >= 128 {
+			name = m128Name(name)
+			gy = ceilDiv(uint32(m), 128)
+		}
 		if gx <= maxWorkGroups && gy <= maxWorkGroups {
 			if err := b.dispatch(name, []*buffer{wb, db, out}, push(uint32(k), uint32(n), uint32(m), uint32(0), uint32(n), uint32(0)), [3]uint32{gx, gy, 1}); err != nil {
 				b.Free(out)
