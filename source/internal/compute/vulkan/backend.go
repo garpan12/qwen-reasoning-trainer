@@ -2232,7 +2232,10 @@ func (b *Backend) zeroFill(x *buffer) error {
 	if x.size == 0 {
 		return nil
 	}
-	if x.mapped != nil {
+	// Small mapped buffers are cleared directly. Large ones are often
+	// host-visible VRAM (resizable BAR), where a CPU memclr crosses PCIe: in the
+	// 27B training step that was ~2.8 s of host time per step with the GPU idle.
+	if x.mapped != nil && (x.size <= 64<<10 || b.vk.CmdFillBuffer == 0) {
 		clear(unsafe.Slice((*byte)(unsafe.Add(x.mapped, x.offset)), x.size))
 		return nil
 	}
