@@ -451,6 +451,7 @@ type vk struct {
 	CmdDispatch                        uintptr
 	CmdPipelineBarrier                 uintptr
 	CmdCopyBuffer                      uintptr
+	CmdFillBuffer                      uintptr
 	CmdResetQueryPool                  uintptr
 	CmdWriteTimestamp                  uintptr
 	CreateQueryPool                    uintptr
@@ -516,6 +517,7 @@ func (v *vk) loadAll(instance uintptr) {
 		&v.CmdDispatch:                        "vkCmdDispatch",
 		&v.CmdPipelineBarrier:                 "vkCmdPipelineBarrier",
 		&v.CmdCopyBuffer:                      "vkCmdCopyBuffer",
+		&v.CmdFillBuffer:                      "vkCmdFillBuffer",
 		&v.CmdResetQueryPool:                  "vkCmdResetQueryPool",
 		&v.CmdWriteTimestamp:                  "vkCmdWriteTimestamp",
 		&v.CreateQueryPool:                    "vkCreateQueryPool",

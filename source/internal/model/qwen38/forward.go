@@ -163,6 +163,11 @@ func NewStateWithOptions(cfg *Config, opt StateOptions) (*State, error) {
 }
 
 func uploadDeviceZeros(be compute.Backend, dims ...int) (compute.Buffer, error) {
+	if z, ok := be.(interface {
+		Zeros(dims ...int) (compute.Buffer, error)
+	}); ok {
+		return z.Zeros(dims...)
+	}
 	n := 1
 	for _, d := range dims {
 		n *= d
