@@ -676,6 +676,8 @@ type Stats struct {
 	PooledBytes     uint64
 	DeviceBytes     uint64
 	PeakDeviceBytes uint64
+	// PoolDrains counts pool flushes forced by out-of-device-memory allocations.
+	PoolDrains uint64
 	// Per-shader dispatch counts and optional GPU timestamp totals (ns).
 	ShaderDispatches map[string]uint64
 	ShaderTicks      map[string]uint64
@@ -1225,9 +1227,32 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 	}
 	mai := memoryAllocateInfo{sType: vkStructureMemoryAllocateInfo, allocationSize: req.size, memoryTypeIndex: idx}
 	var mem uintptr
-	if res := vkCall(b.vk.AllocateMemory, b.device, uintptr(unsafe.Pointer(&mai)), 0, uintptr(unsafe.Pointer(&mem))); res != vkSuccess {
+	alloc := func() uintptr {
+		return vkCall(b.vk.AllocateMemory, b.device, uintptr(unsafe.Pointer(&mai)), 0, uintptr(unsafe.Pointer(&mem)))
+	}
+	res := alloc()
+	// Out of device memory: release idle pooled buffers and retry. Pooled
+	// buffers are never referenced by in-flight work (flush is synchronous and
+	// buffers freed while recording wait in b.pending), so they are always safe
+	// to free. If that is not enough and a batch is being recorded, flush it so
+	// its pending frees reach the pool, drain again and retry once more. Without
+	// this, a full pool (up to VRAM/4 of idle buffers) turned a transient peak
+	// into a fatal error in a long training run.
+	if res != vkSuccess && b.poolBytes > 0 {
+		b.stats.PoolDrains++
+		b.drainPool()
+		res = alloc()
+	}
+	if res != vkSuccess && b.recording {
+		if ferr := b.flush(); ferr == nil {
+			b.stats.PoolDrains++
+			b.drainPool()
+			res = alloc()
+		}
+	}
+	if res != vkSuccess {
 		vkCall(b.vk.DestroyBuffer, b.device, buf, 0)
-		return nil, fmt.Errorf("vulkan: allocate memory failed")
+		return nil, fmt.Errorf("vulkan: allocate memory failed (%d bytes)", req.size)
 	}
 	if res := vkCall(b.vk.BindBufferMemory, b.device, buf, mem, 0); res != vkSuccess {
 		vkCall(b.vk.FreeMemory, b.device, mem, 0)
