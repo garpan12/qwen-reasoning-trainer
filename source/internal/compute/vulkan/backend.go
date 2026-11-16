@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"unsafe"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
@@ -2774,6 +2775,22 @@ func (b *Backend) rowGEMVShader(typ quant.Type) (string, bool) {
 	return name, ok
 }
 
+// coopMatGEMM reports whether the tensor-core *_cm_* fused GEMMs are used. They
+// need cooperative matrices and assume 32-lane subgroups (8 per 256-invocation
+// workgroup), so they are limited to NVIDIA. QWEN38_COOPMAT=0 disables them.
+func (b *Backend) coopMatGEMM() bool {
+	return b.coopMat && b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_COOPMAT") != "0"
+}
+
+// coopMatName maps a fused GEMM shader name (matmul_wq_* / matmul_t_wq_*) to its
+// tensor-core variant.
+func coopMatName(name string) string {
+	if strings.HasPrefix(name, "matmul_t_wq_") {
+		return "matmul_t_wq_cm_" + strings.TrimPrefix(name, "matmul_t_wq_")
+	}
+	return "matmul_wq_cm_" + strings.TrimPrefix(name, "matmul_wq_")
+}
+
 // gemv computes y = W * x for a single activation column using a fused
 // dequantize+GEMV shader. It returns errNoGemv when the type has no shader.
 func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
@@ -2961,6 +2978,9 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 	// Multi-token: a fused dequantize+GEMM decodes the weight in registers, so
 	// no float32 scratch is materialized (no maxStorageBufferRange pressure).
 	if name, ok := matmulWShaders[wb.typ]; ok && !b.noFusedFwd {
+		if b.coopMatGEMM() {
+			name = coopMatName(name)
+		}
 		gx := ceilDiv(uint32(n), 64)
 		gy := ceilDiv(uint32(m), 64)
 		if gx <= maxWorkGroups && gy <= maxWorkGroups {
@@ -3071,6 +3091,9 @@ func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, e
 	}
 
 	if name, ok := matmulTWShaders[wb.typ]; ok && !b.noFusedT {
+		if b.coopMatGEMM() {
+			name = coopMatName(name)
+		}
 		gx := ceilDiv(uint32(k), 64)
 		gy := ceilDiv(uint32(m), 64)
 		if gx <= maxWorkGroups && gy <= maxWorkGroups {
