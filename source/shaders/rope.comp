@@ -37,6 +37,21 @@ float yarnRamp(uint i, float low, float high) {
     return clamp((float(i) - low) / (high - low), 0.0, 1.0);
 }
 
+// Reduce an angle to [-pi, pi] before sin/cos. NVIDIA (and the Vulkan spec)
+// only guarantee sin/cos accuracy for small arguments, and RoPE angles reach
+// pos*freq ~ 1e5+ at long context. 2*pi is split into three fp32 parts
+// (Cody-Waite) so k*2pi is subtracted with fma at near-exact precision.
+float reduceAngle(float a) {
+    const float TWO_PI_A = 6.28125;
+    const float TWO_PI_B = 1.9353071693331003e-3;
+    const float TWO_PI_C = 1.0253131677018246e-11;
+    float k = round(a * 0.15915494309189535);
+    float r = fma(-k, TWO_PI_A, a);
+    r = fma(-k, TWO_PI_B, r);
+    r = fma(-k, TWO_PI_C, r);
+    return r;
+}
+
 void main() {
     uint hd = p.nDims / 2u;
     uint total = p.nTok * p.nHead * p.headDim;
@@ -58,7 +73,7 @@ void main() {
             float ramp = yarnRamp(e, low, high);
             freq = (1.0 - ramp) * (freq / p.factor) + ramp * freq;
         }
-        float ang = float(pos[t]) * freq;
+        float ang = reduceAngle(float(pos[t]) * freq);
         float c = cos(ang);
         float s = sin(ang);
         float x0 = x[base + e];

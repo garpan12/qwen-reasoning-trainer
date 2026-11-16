@@ -133,6 +133,7 @@ void main() {
                 barrier();
             }
             float newM = max(m[qi], red[qi][0]);
+            barrier(); // all lanes must read red[0] before lane 0 overwrites it
             float c = exp(m[qi] - newM);
             corr[qi] = c;
             float ls = 0.0;
