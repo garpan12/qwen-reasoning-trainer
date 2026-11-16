@@ -34,8 +34,8 @@ var gemvShaders = map[quant.Type]string{
 var gemvRowShaders = map[quant.Type]string{
 	quant.TypeQ8_0: "gemv_row_q8_0",
 	quant.TypeQ4_K: "gemv_row_q4_k",
-	// Q5_K currently stays on the row-per-thread fast path: the cooperative
-	// shader is slower than the legacy kernel at the model's projection shapes.
+	// Q5_K: row-cooperative only on NVIDIA, see rowGEMVShader.
+	quant.TypeQ5_K:   "gemv_row_q5_k",
 	quant.TypeQ6_K:   "gemv_row_q6_k",
 	quant.TypeIQ4_XS: "gemv_row_iq4_xs",
 }
@@ -2748,12 +2748,38 @@ func (b *Backend) DequantWeight(w compute.Buffer) (compute.Buffer, error) {
 	return b.dequantRange(x, 0, 0, count, x.dims)
 }
 
+// vendorNVIDIA is the PCI vendor id reported in VkPhysicalDeviceProperties.
+const vendorNVIDIA = 0x10DE
+
+// rowGEMVShader returns the row-cooperative GEMV shader for typ, if any.
+//
+// Q5_K is vendor dependent. On AMD RDNA3 the row-per-thread gemv_q5_k_fast
+// kernel wins at the model's projection shapes. On NVIDIA its strided
+// per-thread reads do not coalesce: on an L40S it reached ~21% of memory
+// bandwidth and was 44% of decode GPU time, while gemv_row_q5_k runs ~3x faster
+// (decode 11.5 -> 14.7 tok/s). QWEN38_Q5K_ROW=1/0 forces either choice.
+func (b *Backend) rowGEMVShader(typ quant.Type) (string, bool) {
+	name, ok := gemvRowShaders[typ]
+	if ok && typ == quant.TypeQ5_K {
+		switch os.Getenv("QWEN38_Q5K_ROW") {
+		case "1":
+		case "0":
+			return "", false
+		default:
+			if b.vendorID != vendorNVIDIA {
+				return "", false
+			}
+		}
+	}
+	return name, ok
+}
+
 // gemv computes y = W * x for a single activation column using a fused
 // dequantize+GEMV shader. It returns errNoGemv when the type has no shader.
 func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
 	name, rowCooperative := "", false
 	if !legacyGEMV {
-		name, rowCooperative = gemvRowShaders[w.typ]
+		name, rowCooperative = b.rowGEMVShader(w.typ)
 	}
 	if !rowCooperative {
 		var ok bool
