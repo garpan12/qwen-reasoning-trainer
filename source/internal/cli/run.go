@@ -1349,10 +1349,15 @@ func runDeviceTrain(cfg *Config, g *gguf.File, w *qwen38.Weights, loCfg train.Lo
 
 	fmt.Fprintf(stderr, "device training: %d examples (%d val), %d adapters, steps %d..%d\n",
 		len(data), len(valData), len(dm.AdapterLins()), startStep, o.steps)
-	if len(valData) > 0 {
+	// The baseline is only worth computing at step 0: it is one forward pass per
+	// validation example (~13 min for 119 examples at T=1024 on an L40S), and a
+	// resume would pay it again for no new information.
+	if len(valData) > 0 && startStep == 0 {
 		if vl, err := dm.EvalLoss(valData); err == nil {
 			fmt.Fprintf(stderr, "val loss before: %.4f\n", vl)
 		}
+	} else if len(valData) > 0 {
+		fmt.Fprintf(stderr, "resuming at step %d: skipping the pre-training val loss\n", startStep)
 	}
 
 	tr := &train.DeviceTrainer{
