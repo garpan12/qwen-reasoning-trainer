@@ -1226,7 +1226,26 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 	}
 	mai := memoryAllocateInfo{sType: vkStructureMemoryAllocateInfo, allocationSize: req.size, memoryTypeIndex: idx}
 	var mem uintptr
-	if res := vkCall(b.vk.AllocateMemory, b.device, uintptr(unsafe.Pointer(&mai)), 0, uintptr(unsafe.Pointer(&mem))); res != vkSuccess {
+	res := vkCall(b.vk.AllocateMemory, b.device, uintptr(unsafe.Pointer(&mai)), 0, uintptr(unsafe.Pointer(&mem)))
+	if res != vkSuccess && !hostOnly && !b.forceStaging &&
+		b.memProps.memoryTypes[idx].propertyFlags&vkMemoryPropertyHostVisible != 0 {
+		// A host-visible device-local memory type exists (so selection succeeded) but
+		// vkAllocateMemory failed for this size: the GPU exposes only a small BAR
+		// window, not full ReBAR (common on cloud rentals). Fall back to
+		// non-host-visible device-local memory -- CPU access then goes through staging
+		// -- and latch force-staging so later allocations skip the failing path. This
+		// is QWEN38_FORCE_STAGING=1, auto-detected on the first failure.
+		if didx, dok := b.memoryTypeExclude(req.memoryTypeBits, vkMemoryPropertyDevice, vkMemoryPropertyHostVisible); dok {
+			mai.memoryTypeIndex = didx
+			if r2 := vkCall(b.vk.AllocateMemory, b.device, uintptr(unsafe.Pointer(&mai)), 0, uintptr(unsafe.Pointer(&mem))); r2 == vkSuccess {
+				fmt.Fprintln(os.Stderr, "vulkan: host-visible device-local allocation failed (small BAR window); enabling force-staging")
+				b.forceStaging = true
+				idx = didx
+				res = vkSuccess
+			}
+		}
+	}
+	if res != vkSuccess {
 		vkCall(b.vk.DestroyBuffer, b.device, buf, 0)
 		return nil, fmt.Errorf("vulkan: allocate memory failed")
 	}
