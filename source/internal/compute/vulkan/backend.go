@@ -2812,18 +2812,41 @@ func (b *Backend) rowGEMVShader(typ quant.Type) (string, bool) {
 	return name, ok
 }
 
-// gemmM128 selects the 128-token-tile fused GEMMs (matmul_wq_m128_*,
-// matmul_t_wq_m128_*) for activations with at least 128 columns. A wider tile
-// halves the per-FLOP cost of dequantizing the weight, which bounds the fused
-// GEMMs. QWEN38_GEMM_M128=0 keeps the 64-token tile.
-var gemmM128 = os.Getenv("QWEN38_GEMM_M128") != "0"
-
-// m128Name maps a fused GEMM shader name to its 128-token-tile variant.
-func m128Name(name string) string {
-	if strings.HasPrefix(name, "matmul_t_wq_") {
-		return "matmul_t_wq_m128_" + strings.TrimPrefix(name, "matmul_t_wq_")
+// gemmMaxTile is the widest token tile (activation columns per workgroup) the
+// fused GEMMs may use: 64, 128 or 256. Every workgroup dequantizes its whole
+// weight tile, so a wider tile divides the per-FLOP decode cost, which bounds
+// these kernels. QWEN38_GEMM_MTILE overrides it; QWEN38_GEMM_M128=0 (older
+// switch) means 64.
+var gemmMaxTile = func() int {
+	if os.Getenv("QWEN38_GEMM_M128") == "0" {
+		return 64
 	}
-	return "matmul_wq_m128_" + strings.TrimPrefix(name, "matmul_wq_")
+	switch os.Getenv("QWEN38_GEMM_MTILE") {
+	case "64":
+		return 64
+	case "128":
+		return 128
+	}
+	return 256
+}()
+
+// gemmTile picks the fused GEMM token tile for m activation columns and maps
+// the shader name to that variant.
+func gemmTile(name string, m int) (string, uint32) {
+	tile := 64
+	if gemmMaxTile >= 256 && m >= 256 {
+		tile = 256
+	} else if gemmMaxTile >= 128 && m >= 128 {
+		tile = 128
+	}
+	if tile == 64 {
+		return name, 64
+	}
+	tag := fmt.Sprintf("m%d_", tile)
+	if strings.HasPrefix(name, "matmul_t_wq_") {
+		return "matmul_t_wq_" + tag + strings.TrimPrefix(name, "matmul_t_wq_"), uint32(tile)
+	}
+	return "matmul_wq_" + tag + strings.TrimPrefix(name, "matmul_wq_"), uint32(tile)
 }
 
 // gemv computes y = W * x for a single activation column using a fused
@@ -3015,10 +3038,9 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 	if name, ok := matmulWShaders[wb.typ]; ok && !b.noFusedFwd {
 		gx := ceilDiv(uint32(n), 64)
 		gy := ceilDiv(uint32(m), 64)
-		if gemmM128 && m >= 128 {
-			name = m128Name(name)
-			gy = ceilDiv(uint32(m), 128)
-		}
+		var tile uint32
+		name, tile = gemmTile(name, m)
+		gy = ceilDiv(uint32(m), tile)
 		if gx <= maxWorkGroups && gy <= maxWorkGroups {
 			out, err := b.newF32Buffer(n, m)
 			if err != nil {
@@ -3129,10 +3151,9 @@ func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, e
 	if name, ok := matmulTWShaders[wb.typ]; ok && !b.noFusedT {
 		gx := ceilDiv(uint32(k), 64)
 		gy := ceilDiv(uint32(m), 64)
-		if gemmM128 && m >= 128 {
-			name = m128Name(name)
-			gy = ceilDiv(uint32(m), 128)
-		}
+		var tile uint32
+		name, tile = gemmTile(name, m)
+		gy = ceilDiv(uint32(m), tile)
 		if gx <= maxWorkGroups && gy <= maxWorkGroups {
 			if err := b.dispatch(name, []*buffer{wb, db, out}, push(uint32(k), uint32(n), uint32(m), uint32(0), uint32(n), uint32(0)), [3]uint32{gx, gy, 1}); err != nil {
 				b.Free(out)

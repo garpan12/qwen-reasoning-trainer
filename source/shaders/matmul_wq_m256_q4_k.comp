@@ -1,0 +1,9 @@
+#version 450
+// 256-token tile variant: each workgroup covers 256 activation columns, so each
+// dequantized weight element is reused 4x as often as in the 64-token tile.
+#define TN 256
+#define TNMICRO 16
+// Fused q4_k dequantize + GEMM (forward). Generated dispatch wrapper; the body
+// and decoder live in matmul_wq_body.glsl / quant_decode.glsl.
+#define QDECODE(n, kk) deq_q4_k(n, kk)
+#include "matmul_wq_body.glsl"
