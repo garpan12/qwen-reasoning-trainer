@@ -20,6 +20,8 @@ func TestVulkanGatedDeltaNetChunkedBackward(t *testing.T) {
 	cases := []struct{ sv, h, nTok, chunk int }{
 		{4, 3, 19, 1}, {4, 3, 19, 4}, {4, 3, 19, 7}, {4, 3, 19, 32},
 		{8, 2, 70, 64}, {5, 2, 13, 5},
+		// sv a multiple of the subgroup size: the subgroup-reduced atomics path.
+		{32, 1, 9, 4}, {32, 1, 20, 8}, {32, 2, 20, 8}, {64, 1, 9, 8},
 	}
 	for _, tc := range cases {
 		for _, kda := range []bool{false, true} {

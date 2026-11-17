@@ -10,6 +10,8 @@
 // See gdn_chunk_cumsum.comp for the work layout.
 
 #extension GL_EXT_shader_atomic_float : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 #define MAX_SV 128
 #define MAX_C 64
@@ -36,6 +38,37 @@ layout(push_constant) uniform P {
     uint NC;
     float scale;
 } p;
+
+// Every lane of a head adds into the same C x C dA/dBt entries and dBeta slots,
+// so plain atomics were 128-way contended (~600M per call at T=1024). When sv
+// is a multiple of the subgroup size, a subgroup never spans two heads and its
+// lanes walk identical (uniform) loops, so each contribution is summed with
+// subgroupAdd first and one lane does the atomic: 32x fewer global atomics.
+bool sgReduce() {
+    return p.sv % gl_SubgroupSize == 0u;
+}
+
+void addW(uint idx, float v) {
+    if (sgReduce()) {
+        float s = subgroupAdd(v);
+        if (subgroupElect()) {
+            atomicAdd(w[idx], s);
+        }
+    } else {
+        atomicAdd(w[idx], v);
+    }
+}
+
+void addBeta(uint idx, float v) {
+    if (sgReduce()) {
+        float s = subgroupAdd(v);
+        if (subgroupElect()) {
+            atomicAdd(dbev[idx], s);
+        }
+    } else {
+        atomicAdd(dbev[idx], v);
+    }
+}
 
 void main() {
     uint gid = gl_GlobalInvocationID.x; // hh * sv + j
@@ -107,7 +140,7 @@ void main() {
                 dSc[i] += p.scale * dor * exp(w[gcBase + r * p.sv + i]) * qv[((t0 + r) * p.h + hh) * p.sv + i];
             }
             for (uint pp = 0u; pp <= r; pp++) {
-                atomicAdd(w[dbBase + r * p.C + pp], p.scale * dor * deltas[pp]);
+                addW(dbBase + r * p.C + pp, p.scale * dor * deltas[pp]);
                 ddelta[pp] += p.scale * w[bBase + r * p.C + pp] * dor;
             }
         }
@@ -121,17 +154,18 @@ void main() {
             }
             zsol[r] = z;
             float br = betav[(t0 + r) * p.h + hh];
+            float dbAcc = 0.0;
             for (uint pp = 0u; pp < r; pp++) {
                 float dm = -z * deltas[pp];
-                atomicAdd(w[daBase + pp * p.C + r], br * dm);
-                atomicAdd(dbev[(t0 + r) * p.h + hh], dm * w[aBase + pp * p.C + r]);
+                addW(daBase + pp * p.C + r, br * dm);
+                dbAcc += dm * w[aBase + pp * p.C + r];
             }
             dvv[((t0 + r) * p.h + hh) * p.sv + j] += br * z;
             float s = 0.0;
             for (uint i = 0u; i < p.sv; i++) {
                 s += Sc[i] * exp(w[gcBase + r * p.sv + i]) * kv[((t0 + r) * p.h + hh) * p.sv + i];
             }
-            atomicAdd(dbev[(t0 + r) * p.h + hh], z * (vv[((t0 + r) * p.h + hh) * p.sv + j] - s));
+            addBeta((t0 + r) * p.h + hh, dbAcc + z * (vv[((t0 + r) * p.h + hh) * p.sv + j] - s));
             for (uint i = 0u; i < p.sv; i++) {
                 dSc[i] -= br * z * exp(w[gcBase + r * p.sv + i]) * kv[((t0 + r) * p.h + hh) * p.sv + i];
             }
