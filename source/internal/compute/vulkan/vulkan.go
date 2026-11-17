@@ -790,6 +790,7 @@ func New() (*Backend, error) {
 	b := &Backend{
 		vk: v, lib: lib, instance: instance, pipelines: map[string]uintptr{},
 		flashAttention: true, profile: os.Getenv("QWEN38_PROFILE") == "1",
+		forceStaging:   os.Getenv("QWEN38_FORCE_STAGING") == "1",
 		stats: Stats{ShaderDispatches: map[string]uint64{}, ShaderTicks: map[string]uint64{}},
 	}
 
