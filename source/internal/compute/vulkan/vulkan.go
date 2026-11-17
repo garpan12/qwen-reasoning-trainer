@@ -1238,8 +1238,9 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 		if didx, dok := b.memoryTypeExclude(req.memoryTypeBits, vkMemoryPropertyDevice, vkMemoryPropertyHostVisible); dok {
 			mai.memoryTypeIndex = didx
 			if r2 := vkCall(b.vk.AllocateMemory, b.device, uintptr(unsafe.Pointer(&mai)), 0, uintptr(unsafe.Pointer(&mem))); r2 == vkSuccess {
-				fmt.Fprintln(os.Stderr, "vulkan: host-visible device-local allocation failed (small BAR window); enabling force-staging")
-				b.forceStaging = true
+				smallBAROnce.Do(func() {
+					fmt.Fprintln(os.Stderr, "vulkan: host-visible device-local allocation failed (small BAR window); staging large buffers (keeping small ones mapped)")
+				})
 				idx = didx
 				res = vkSuccess
 			}
@@ -1832,3 +1833,6 @@ func vkCall(fn uintptr, args ...uintptr) uintptr {
 	r, _, _ := purego.SyscallN(fn, args...)
 	return r
 }
+
+// smallBAROnce logs the small-BAR-window fallback a single time.
+var smallBAROnce sync.Once
