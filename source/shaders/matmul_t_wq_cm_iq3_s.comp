@@ -1,0 +1,5 @@
+#version 450
+// Tensor-core variant (cooperative matrix); see the _cm_ body for precision notes.
+// Fused iq3_s dequantize + transposed GEMM (dX = W^T dY).
+#define QDECODE(n, kk) deq_iq3_s(n, kk)
+#include "matmul_t_wq_cm_body.glsl"

@@ -1,0 +1,4 @@
+#version 450
+// Per-element iq3_s dequant (decode-once GEMMs); see dequant_e_body.glsl.
+#define QDECODE(n, kk) deq_iq3_s(n, kk)
+#include "dequant_e_body.glsl"

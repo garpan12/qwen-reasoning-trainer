@@ -1,0 +1,4 @@
+#version 450
+// Per-element f16 dequant (decode-once GEMMs); see dequant_e_body.glsl.
+#define QDECODE(n, kk) deq_f16(n, kk)
+#include "dequant_e_body.glsl"

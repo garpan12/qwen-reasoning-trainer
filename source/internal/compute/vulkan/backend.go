@@ -2826,6 +2826,52 @@ func m128Name(name string) string {
 	return "matmul_wq_m128_" + strings.TrimPrefix(name, "matmul_wq_")
 }
 
+// decodeOnce makes the tensor-core GEMMs dequantize each weight once per call
+// into fp32 scratch and multiply from that, instead of re-decoding every
+// quantized element once per 64-token output tile (16x at T=1024).
+// QWEN38_DECODE_ONCE=0 keeps the fused per-tile decode.
+var decodeOnce = os.Getenv("QWEN38_DECODE_ONCE") != "0"
+
+// decodeOnceMaxFloats caps the scratch (1 GiB of fp32); larger weights such
+// as the LM head keep the fused path.
+const decodeOnceMaxFloats = 256 << 20
+
+// dequantElem dequantizes a whole weight to an fp32 [N][K] buffer with the
+// coalesced per-element dequant_e_<typ> kernel (same decoders as the fused
+// GEMMs). typ is the shader suffix, e.g. "q4_k".
+func (b *Backend) dequantElem(wb *buffer, typ string, k, n int) (*buffer, error) {
+	out, err := b.newF32Buffer(k, n)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(n * k)
+	groups := ceilDiv(total, 256)
+	if groups > maxWorkGroups {
+		groups = maxWorkGroups
+	}
+	if err := b.dispatch("dequant_e_"+typ, []*buffer{wb, out}, push(uint32(k), uint32(n), total, uint32(0)), [3]uint32{groups, 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// coopMatGEMM reports whether the tensor-core *_cm_* fused GEMMs are used. They
+// need cooperative matrices and assume 32-lane subgroups (8 per 256-invocation
+// workgroup), so they are limited to NVIDIA. QWEN38_COOPMAT=0 disables them.
+func (b *Backend) coopMatGEMM() bool {
+	return b.coopMat && b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_COOPMAT") != "0"
+}
+
+// coopMatName maps a fused GEMM shader name (matmul_wq_* / matmul_t_wq_*) to its
+// tensor-core variant.
+func coopMatName(name string) string {
+	if strings.HasPrefix(name, "matmul_t_wq_") {
+		return "matmul_t_wq_cm_" + strings.TrimPrefix(name, "matmul_t_wq_")
+	}
+	return "matmul_wq_cm_" + strings.TrimPrefix(name, "matmul_wq_")
+}
+
 // gemv computes y = W * x for a single activation column using a fused
 // dequantize+GEMV shader. It returns errNoGemv when the type has no shader.
 func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
@@ -3013,9 +3059,30 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 	// Multi-token: a fused dequantize+GEMM decodes the weight in registers, so
 	// no float32 scratch is materialized (no maxStorageBufferRange pressure).
 	if name, ok := matmulWShaders[wb.typ]; ok && !b.noFusedFwd {
+		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats {
+			scratch, err := b.dequantElem(wb, strings.TrimPrefix(name, "matmul_wq_"), k, n)
+			if err != nil {
+				return nil, err
+			}
+			out, err := b.newF32Buffer(n, m)
+			if err != nil {
+				b.Free(scratch)
+				return nil, err
+			}
+			err = b.dispatch("matmul_wq_cm_f32", []*buffer{scratch, xb, out}, push(uint32(k), uint32(n), uint32(m), uint32(0)), [3]uint32{ceilDiv(uint32(m), 64), ceilDiv(uint32(n), 64), 1})
+			b.Free(scratch)
+			if err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
+		if b.coopMatGEMM() {
+			name = coopMatName(name)
+		}
 		gx := ceilDiv(uint32(n), 64)
 		gy := ceilDiv(uint32(m), 64)
-		if gemmM128 && m >= 128 {
+		if gemmM128 && m >= 128 && !b.coopMatGEMM() {
 			name = m128Name(name)
 			gy = ceilDiv(uint32(m), 128)
 		}
@@ -3127,9 +3194,26 @@ func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, e
 	}
 
 	if name, ok := matmulTWShaders[wb.typ]; ok && !b.noFusedT {
+		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats {
+			scratch, err := b.dequantElem(wb, strings.TrimPrefix(name, "matmul_t_wq_"), k, n)
+			if err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			err = b.dispatch("matmul_t_wq_cm_f32", []*buffer{scratch, db, out}, push(uint32(k), uint32(n), uint32(m), uint32(0), uint32(n), uint32(0)), [3]uint32{ceilDiv(uint32(m), 64), ceilDiv(uint32(k), 64), 1})
+			b.Free(scratch)
+			if err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
+		if b.coopMatGEMM() {
+			name = coopMatName(name)
+		}
 		gx := ceilDiv(uint32(k), 64)
 		gy := ceilDiv(uint32(m), 64)
-		if gemmM128 && m >= 128 {
+		if gemmM128 && m >= 128 && !b.coopMatGEMM() {
 			name = m128Name(name)
 			gy = ceilDiv(uint32(m), 128)
 		}
