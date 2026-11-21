@@ -483,12 +483,6 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 
 	rfPrompts := encodePrompts(vocab, *system, rfLines)
 	klPrompts := encodePrompts(vocab, *system, klLines)
-	fmt.Fprintf(stderr, "computing baseline logits (%d KL prompts)...\n", len(klPrompts))
-	baseLogits, err := evaluate.BaselineLogits(m, klPrompts)
-	if err != nil {
-		fmt.Fprintln(stderr, "error:", err)
-		return 1
-	}
 
 	// Snapshot the abliterable weights so each trial starts from the pristine
 	// bytes. Ablate replaces Raw; it never mutates the input slice.
@@ -521,6 +515,18 @@ func cmdAbliterateSearch(cfg *Config, stdout, stderr io.Writer) int {
 	}
 	if len(prior) >= *trials {
 		fmt.Fprintf(stderr, "study already has %d trials (>= --trials %d); nothing to do\n", len(prior), *trials)
+	}
+	// The baseline is only needed to score new trials. It runs on the host path
+	// (the device model is freed after residual collection) and is slow, so skip
+	// it when the study already covers --trials (e.g. to write the best so far).
+	var baseLogits [][]float32
+	if len(prior) < *trials {
+		fmt.Fprintf(stderr, "computing baseline logits (%d KL prompts)...\n", len(klPrompts))
+		baseLogits, err = evaluate.BaselineLogits(m, klPrompts)
+		if err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 1
+		}
 	}
 	sampler := abliterate.NewSampler(*samplerName, space.Dims(), *seed)
 	fmt.Fprintf(stderr, "search: sampler=%s dims=%d trials=%d lambda=%.3f refusals=%d kl=%d\n",
