@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -204,7 +205,10 @@ func (s *server) buildRequest(req *ChatCompletionRequest) (inference.ChatRequest
 		tools = nil
 	}
 
-	thinking := true
+	// QWEN38_NO_THINK=1 makes thinking default to off for requests that don't
+	// set it (e.g. opencode), so long agent sessions don't spend the output
+	// budget on reasoning. Explicit enable_thinking still wins.
+	thinking := os.Getenv("QWEN38_NO_THINK") != "1"
 	if req.EnableThinking != nil {
 		thinking = *req.EnableThinking
 	} else if v, ok := req.ChatTemplateKwargs["enable_thinking"].(bool); ok {
