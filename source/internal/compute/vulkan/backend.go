@@ -1531,6 +1531,7 @@ func (b *Backend) WriteKV(cache compute.Buffer, byteOffset int, data []byte) err
 		return err
 	}
 	region := bufferCopy{srcOffset: 0, dstOffset: x.offset + uint64(byteOffset), size: uint64(len(data))}
+	b.flushHazards()
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, staging.buf, x.buf, 1, uintptr(unsafe.Pointer(&region)))
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,
@@ -2246,6 +2247,7 @@ func (b *Backend) zeroFill(x *buffer) error {
 	if err := b.beginBatch(); err != nil {
 		return err
 	}
+	b.flushHazards()
 	vkCall(b.vk.CmdFillBuffer, b.cmdBuffer, x.buf, uintptr(x.offset), uintptr(x.size&^3), 0)
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,
@@ -2661,6 +2663,7 @@ func (b *Backend) Copy(dst, src compute.Buffer) error {
 	// Prior compute writes to src must be visible to the transfer stage, and
 	// the result visible to later compute.
 	pre := memoryBarrier{sType: vkStructureMemoryBarrier, srcAccessMask: vkAccessShaderWrite, dstAccessMask: vkAccessTransferRead}
+	b.flushHazards()
 	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageCompute, vkPipelineStageTransfer, 0, 1, uintptr(unsafe.Pointer(&pre)), 0, 0, 0, 0)
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, s.buf, d.buf, 1, uintptr(unsafe.Pointer(&region)))
 	post := memoryBarrier{sType: vkStructureMemoryBarrier, srcAccessMask: vkAccessTransferWrite, dstAccessMask: vkAccessShaderRead | vkAccessShaderWrite}
@@ -2812,6 +2815,13 @@ func (b *Backend) rowGEMVShader(typ quant.Type) (string, bool) {
 	return name, ok
 }
 
+// gemvSubgroup selects the gemv_row_<t>_sg variants (one 32-lane subgroup per
+// row, subgroupAdd reduction) for single-token decode. NVIDIA only;
+// QWEN38_GEMV_SG=0 keeps the one-workgroup-per-row kernels.
+func (b *Backend) gemvSubgroup() bool {
+	return b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_GEMV_SG") != "0"
+}
+
 // gemmM128 selects the 128-token-tile fused GEMMs (matmul_wq_m128_*,
 // matmul_t_wq_m128_*) for activations with at least 128 columns. A wider tile
 // halves the per-FLOP cost of dequantizing the weight, which bounds the fused
@@ -2850,15 +2860,21 @@ func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
 		return nil, err
 	}
 	if rowCooperative {
-		// One workgroup per row; dispatch in chunks to stay below the
-		// per-dimension group limit.
-		for base := uint32(0); base < uint32(n); base += maxWorkGroups {
+		// One workgroup per row (the _sg variants: 4 rows per workgroup, one
+		// subgroup each); dispatch in chunks to stay below the per-dimension
+		// group limit.
+		rowsPerGroup := uint32(1)
+		if b.gemvSubgroup() {
+			name += "_sg"
+			rowsPerGroup = 4
+		}
+		for base := uint32(0); base < uint32(n); base += maxWorkGroups * rowsPerGroup {
 			rows := uint32(n) - base
-			if rows > maxWorkGroups {
-				rows = maxWorkGroups
+			if rows > maxWorkGroups*rowsPerGroup {
+				rows = maxWorkGroups * rowsPerGroup
 			}
 			pc := push(uint32(k), uint32(n), base)
-			if err := b.dispatch(name, []*buffer{w, x, out}, pc, [3]uint32{rows, 1, 1}); err != nil {
+			if err := b.dispatch(name, []*buffer{w, x, out}, pc, [3]uint32{ceilDiv(rows, rowsPerGroup), 1, 1}); err != nil {
 				b.Free(out)
 				return nil, err
 			}

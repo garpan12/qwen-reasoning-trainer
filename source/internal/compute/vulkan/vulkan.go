@@ -89,6 +89,7 @@ const (
 	vkMemoryPropertyDevice       = 0x00000001
 	vkMemoryPropertyHostVisible  = 0x00000002
 	vkMemoryPropertyHostCoherent = 0x00000004
+	vkMemoryPropertyHostCached   = 0x00000008
 	vkQueueComputeBit            = 0x00000002
 	vkDescriptorTypeStorage      = 7
 	vkShaderStageComputeBit      = 0x00000020
@@ -573,6 +574,14 @@ func hasDeviceExtension(v *vk, pd uintptr, name string) bool {
 
 // Backend is a Vulkan compute backend.
 type Backend struct {
+	// Hazard-tracked barriers (barrier.go): lazyMode 0 = undecided, 1 = on,
+	// 2 = off; ranges written / read since the last barrier; per-pipeline
+	// writable bindings from SPIR-V.
+	lazyMode     int8
+	pendingW     []bufRange
+	pendingR     []bufRange
+	pipeWritable map[string][]bool
+
 	vk             *vk
 	lib            uintptr
 	instance       uintptr
@@ -1202,7 +1211,12 @@ func (b *Backend) allocBufferOpt(size uint64, usage uint32, hostOnly bool) (*buf
 	var idx uint32
 	var ok bool
 	if hostOnly {
-		idx, ok = b.memoryType(req.memoryTypeBits, vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent)
+		// Host-cached first: staging buffers are read back by the CPU, and
+		// uncached (write-combined) reads are slow.
+		idx, ok = b.memoryType(req.memoryTypeBits, vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent|vkMemoryPropertyHostCached)
+		if !ok {
+			idx, ok = b.memoryType(req.memoryTypeBits, vkMemoryPropertyHostVisible|vkMemoryPropertyHostCoherent)
+		}
 	} else if b.forceStaging {
 		idx, ok = b.memoryTypeExclude(req.memoryTypeBits, vkMemoryPropertyDevice, vkMemoryPropertyHostVisible)
 		if !ok {
@@ -1449,6 +1463,10 @@ func (b *Backend) pipeline(name string) (uintptr, error) {
 	}
 	runtime.KeepAlive(eb)
 	b.pipelines[name] = pipe
+	if b.pipeWritable == nil {
+		b.pipeWritable = map[string][]bool{}
+	}
+	b.pipeWritable[name] = spirvWritableBindings(data)
 	return pipe, nil
 }
 
@@ -1468,6 +1486,8 @@ func (b *Backend) beginBatch() error {
 		return fmt.Errorf("vulkan: begin command buffer failed")
 	}
 	b.recording = true
+	b.pendingW = b.pendingW[:0]
+	b.pendingR = b.pendingR[:0]
 	return nil
 }
 
@@ -1479,6 +1499,7 @@ func (b *Backend) beginBatch() error {
 func (b *Backend) flush() error {
 	var ferr error
 	if b.recording {
+		b.flushHazards()
 		b.recording = false
 		if res := vkCall(b.vk.EndCommandBuffer, b.cmdBuffer); res != vkSuccess {
 			ferr = fmt.Errorf("vulkan: end command buffer failed")
@@ -1596,6 +1617,14 @@ func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups 
 		vkCall(b.vk.UpdateDescriptorSets, b.device, uintptr(n), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
 	}
 
+	lazy := b.lazyBarriers()
+	var writable []bool
+	if lazy {
+		writable = b.pipelineWritable(name)
+		if b.needsBarrier(bindings, writable) {
+			b.recordFullBarrier()
+		}
+	}
 	vkCall(b.vk.CmdBindPipeline, b.cmdBuffer, vkPipelineBindPointCompute, pipe)
 	vkCall(b.vk.CmdBindDescriptorSets, b.cmdBuffer, vkPipelineBindPointCompute, b.pipeLayout, 0, 1, uintptr(unsafe.Pointer(&set)), 0, 0)
 	if len(push) > 0 {
@@ -1610,6 +1639,10 @@ func (b *Backend) dispatch(name string, bindings []*buffer, push []byte, groups 
 		vkCall(b.vk.CmdWriteTimestamp, b.cmdBuffer, vkPipelineStageCompute, b.queryPool, uintptr(b.queryCount+1))
 		b.queryCount += 2
 		b.queryNames = append(b.queryNames, name)
+	}
+	if lazy {
+		b.trackDispatch(bindings, writable)
+		return nil
 	}
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,
@@ -1626,6 +1659,7 @@ func (b *Backend) copyRows(dst, src *buffer, rows, m, outRows, rowOffset int) er
 	if err := b.beginBatch(); err != nil {
 		return err
 	}
+	b.flushHazards()
 	pipe, err := b.pipeline("copy_rows")
 	if err != nil {
 		return err
@@ -1727,6 +1761,7 @@ func (b *Backend) writeBytes(x *buffer, src []byte) error {
 		return err
 	}
 	region := bufferCopy{srcOffset: 0, dstOffset: x.offset, size: uint64(len(src))}
+	b.flushHazards()
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, staging.buf, x.buf, 1, uintptr(unsafe.Pointer(&region)))
 	// Make the transfer visible to the compute stage before any dispatch reads
 	// the buffer.
@@ -1742,9 +1777,15 @@ func (b *Backend) writeBytes(x *buffer, src []byte) error {
 
 // readBytes returns a host copy of the buffer's contents, through a staging
 // buffer when the source is not host-visible. It flushes pending commands.
+// mappedReadMax is the largest read served straight from a device buffer's
+// mapping (see readBytes).
+const mappedReadMax = 64 << 10
+
 func (b *Backend) readBytes(x *buffer, n int) ([]byte, error) {
 	b.stats.BytesDownloaded += uint64(n)
-	if x.mapped != nil {
+	// A mapped device buffer (ReBAR) is device-local memory read across PCIe
+	// without caching; large reads are much faster as a DMA into staging.
+	if x.mapped != nil && (x.staging || n < mappedReadMax || os.Getenv("QWEN38_MAPPED_READ") == "1") {
 		if x.offset+uint64(n) > x.size {
 			return nil, compute.ErrShape
 		}
@@ -1766,6 +1807,7 @@ func (b *Backend) readBytes(x *buffer, n int) ([]byte, error) {
 		srcAccessMask: vkAccessShaderWrite,
 		dstAccessMask: vkAccessTransferRead,
 	}
+	b.flushHazards()
 	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageCompute, vkPipelineStageTransfer, 0, 1, uintptr(unsafe.Pointer(&barrier)), 0, 0, 0, 0)
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, x.buf, staging.buf, 1, uintptr(unsafe.Pointer(&region)))
 	if err := b.flush(); err != nil {
