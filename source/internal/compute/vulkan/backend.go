@@ -1737,6 +1737,22 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 	const flashQueries = 16
 	if nQ > 4 {
 		blocks := (nQ + flashQueries - 1) / flashQueries
+		// Tensor-core prefill attention (opt-in while being validated).
+		if kb.typ == quant.TypeQ4_K && hd == 256 && nQ%flashQueries == 0 && b.flashTC() &&
+			blocks <= maxPerDispatch && nHead <= maxPerDispatch {
+			out, err := b.newF32Buffer(qb.dims...)
+			if err != nil {
+				return nil, err
+			}
+			p := push(uint32(hd), uint32(nQ), uint32(nHead), uint32(nHeadKV),
+				uint32(nKV), uint32(capacity), qStart, scale)
+			if err := b.dispatch("attention_flash_q4k_tc", []*buffer{qb, kb, vb, out}, p,
+				[3]uint32{uint32(blocks), uint32(nHead), 1}); err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
 		if blocks <= maxPerDispatch && nHead <= maxPerDispatch {
 			if b.flashAttention && hd == 256 {
 				if keysPerSplit, splits, ok := flashSplitPlan(nKV, nQ, nHead); ok {
@@ -2960,6 +2976,13 @@ func (b *Backend) dequantElem(wb *buffer, typ string, k, n int) (*buffer, error)
 		return nil, err
 	}
 	return out, nil
+}
+
+// flashTC reports whether prefill attention over a Q4_K cache uses the
+// tensor-core attention_flash_q4k_tc kernel (fp16 inputs, fp32 accumulation).
+// Opt-in via QWEN38_FLASH_TC=1; needs cooperative matrices (NVIDIA).
+func (b *Backend) flashTC() bool {
+	return b.coopMatGEMM() && os.Getenv("QWEN38_FLASH_TC") == "1"
 }
 
 // attnTile reports whether the square attention forward and backward use the
