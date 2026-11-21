@@ -1172,7 +1172,17 @@ func (b *Backend) allocBuffer(size uint64, usage uint32) (*buffer, error) {
 // allocHostBuffer allocates a host-visible, host-coherent buffer used as a
 // staging area for transfers to and from device-local memory.
 func (b *Backend) allocHostBuffer(size uint64, usage uint32) (*buffer, error) {
-	return b.allocBufferOpt(size, usage, true)
+	x, err := b.allocBufferOpt(size, usage, true)
+	if err != nil {
+		return nil, err
+	}
+	// Staging buffers belong to the transfer that allocated them, which
+	// releases them itself (destroyBuffer); a scope must not free them again.
+	if x.scopeIdx >= 0 && x.scopeIdx < len(b.scopeLog) && b.scopeLog[x.scopeIdx] == x {
+		b.scopeLog[x.scopeIdx] = nil
+	}
+	x.scopeIdx = -1
+	return x, nil
 }
 
 // allocBufferOpt creates a buffer. Unless hostOnly is set, it prefers
