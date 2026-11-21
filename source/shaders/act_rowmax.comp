@@ -1,0 +1,39 @@
+#version 450
+// Row max |x| of an fp32 [M][R] matrix, rm[m] = max_r |x[m, r]|. One workgroup per row.
+// Feeds act_split_h2's per-128-row scale.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer X { float x[]; };
+layout(binding = 1) writeonly buffer RM { float rm[]; };
+
+layout(push_constant) uniform P {
+    uint R;
+    uint M;
+} p;
+
+shared float red[32];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    float mx = 0.0;
+    for (uint i = tid; i < p.R; i += 256u) {
+        mx = max(mx, abs(x[row * p.R + i]));
+    }
+    mx = subgroupMax(mx);
+    if (subgroupElect()) {
+        red[gl_SubgroupID] = mx;
+    }
+    barrier();
+    if (tid == 0u) {
+        float t = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; s++) {
+            t = max(t, red[s]);
+        }
+        rm[row] = t;
+    }
+}

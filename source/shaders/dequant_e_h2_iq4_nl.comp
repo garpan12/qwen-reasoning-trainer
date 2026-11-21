@@ -1,0 +1,4 @@
+#version 450
+// Per-element iq4_nl dequant to packed fp16 hi/lo (pre-split GEMMs); see dequant_e_h2_body.glsl.
+#define QDECODE(n, kk) deq_iq4_nl(n, kk)
+#include "dequant_e_h2_body.glsl"

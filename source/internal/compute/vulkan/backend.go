@@ -2840,6 +2840,77 @@ var decodeOnce = os.Getenv("QWEN38_DECODE_ONCE") != "0"
 // as the LM head keep the fused path.
 const decodeOnceMaxFloats = 256 << 20
 
+// gemmH2 selects the pre-split fp16 hi/lo tensor-core GEMMs (matmul_h2_cm,
+// matmul_t_h2_cm) for decode-once calls whose shapes fit their 128x128 tiles.
+// QWEN38_GEMM_H2=0 keeps the matmul_*_cm_f32 path.
+var gemmH2 = os.Getenv("QWEN38_GEMM_H2") != "0"
+
+func h2Fits(m, r, j int) bool {
+	return gemmH2 && m%128 == 0 && j%128 == 0 && r%32 == 0 &&
+		m/128 <= maxWorkGroups && j/128 <= maxWorkGroups
+}
+
+// matmulH2 computes out[mm*j + jj] = sum_r A[mm, r] * B[r, jj] on tensor cores,
+// where A is the fp32 [m][r] matrix xb and B comes from the quantized weight wb
+// of type typ: bt (forward) means wb is [j][r] and used transposed, otherwise
+// (backward dX) wb is [r][j]. Both operands are split into fp16 hi/lo once.
+func (b *Backend) matmulH2(wb *buffer, typ string, xb, out *buffer, m, r, j int, bt bool) error {
+	rows, rowLen := j, r
+	if !bt {
+		rows, rowLen = r, j
+	}
+	total := rows * rowLen
+	var scratch []*buffer
+	defer func() {
+		for _, s := range scratch {
+			b.Free(s)
+		}
+	}()
+	alloc := func(n int) (*buffer, error) {
+		s, err := b.newF32Buffer(n)
+		if err == nil {
+			scratch = append(scratch, s)
+		}
+		return s, err
+	}
+	ws, err := alloc(total) // packed hi/lo halves: 4 bytes per element
+	if err != nil {
+		return err
+	}
+	groups := ceilDiv(uint32(total/2), 256)
+	if groups > maxWorkGroups {
+		groups = maxWorkGroups
+	}
+	if err := b.dispatch("dequant_e_h2_"+typ, []*buffer{wb, ws},
+		push(uint32(rowLen), uint32(rows), uint32(total), uint32(0)), [3]uint32{groups, 1, 1}); err != nil {
+		return err
+	}
+	as, err := alloc(m * r)
+	if err != nil {
+		return err
+	}
+	rm, err := alloc(m)
+	if err != nil {
+		return err
+	}
+	ti, err := alloc(m / 128)
+	if err != nil {
+		return err
+	}
+	if err := b.dispatch("act_rowmax", []*buffer{xb, rm}, push(uint32(r), uint32(m)), [3]uint32{uint32(m), 1, 1}); err != nil {
+		return err
+	}
+	if err := b.dispatch("act_split_h2", []*buffer{xb, rm, as, ti}, push(uint32(r), uint32(m)), [3]uint32{uint32(m), 1, 1}); err != nil {
+		return err
+	}
+	name := "matmul_t_h2_cm"
+	if bt {
+		name = "matmul_h2_cm"
+	}
+	return b.dispatch(name, []*buffer{as, ws, ti, out}, push(uint32(m), uint32(j), uint32(r), uint32(0)),
+		[3]uint32{uint32(m / 128), uint32(j / 128), 1})
+}
+
 // dequantElem dequantizes a whole weight to an fp32 [N][K] buffer with the
 // coalesced per-element dequant_e_<typ> kernel (same decoders as the fused
 // GEMMs). typ is the shader suffix, e.g. "q4_k".
@@ -3079,6 +3150,17 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 	// Multi-token: a fused dequantize+GEMM decodes the weight in registers, so
 	// no float32 scratch is materialized (no maxStorageBufferRange pressure).
 	if name, ok := matmulWShaders[wb.typ]; ok && !b.noFusedFwd {
+		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats && h2Fits(m, k, n) {
+			out, err := b.newF32Buffer(n, m)
+			if err != nil {
+				return nil, err
+			}
+			if err := b.matmulH2(wb, strings.TrimPrefix(name, "matmul_wq_"), xb, out, m, k, n, true); err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
 		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats {
 			scratch, err := b.dequantElem(wb, strings.TrimPrefix(name, "matmul_wq_"), k, n)
 			if err != nil {
@@ -3214,6 +3296,13 @@ func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, e
 	}
 
 	if name, ok := matmulTWShaders[wb.typ]; ok && !b.noFusedT {
+		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats && h2Fits(m, n, k) {
+			if err := b.matmulH2(wb, strings.TrimPrefix(name, "matmul_t_wq_"), db, out, m, n, k, false); err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
 		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats {
 			scratch, err := b.dequantElem(wb, strings.TrimPrefix(name, "matmul_t_wq_"), k, n)
 			if err != nil {
