@@ -2933,6 +2933,11 @@ func (b *Backend) matmulH2(wb *buffer, typ string, xb, out *buffer, m, r, j int,
 	if bt {
 		name = "matmul_h2_cm"
 	}
+	// Opt-in: QWEN38_GEMM_TERMS=2 drops the weight lo term (~6% faster step,
+	// losses within ~1e-3). The 1-term variant diverged (NaN) and was removed.
+	if os.Getenv("QWEN38_GEMM_TERMS") == "2" {
+		name += "_t2"
+	}
 	return b.dispatch(name, []*buffer{as, ws, ti, out}, push(uint32(m), uint32(j), uint32(r), uint32(0)),
 		[3]uint32{uint32(m / 128), uint32(j / 128), 1})
 }

@@ -29,6 +29,21 @@ layout(push_constant) uniform P {
     uint pad;
 } p;
 
+#ifndef TERMS
+#define TERMS 3  // 3: hi*hi + lo*hi + hi*lo; 2: no weight lo (opt-in)
+#endif
+#if TERMS >= 2
+#define LOAD_AL(al, off) coopMatLoad(al, sAl, off, AH, gl_CooperativeMatrixLayoutRowMajor);
+#define MMA_AL(C, al, b) C = coopMatMulAdd(al, b, C);
+#else
+#define LOAD_AL(al, off)
+#define MMA_AL(C, al, b)
+#endif
+#if TERMS >= 3
+#define MMA_BL(C, ah, bl) C = coopMatMulAdd(ah, bl, C);
+#else
+#define MMA_BL(C, ah, bl)
+#endif
 #ifndef WTM
 #define WTM 4    // 16-row fragments per subgroup along m
 #endif
@@ -87,9 +102,11 @@ void main() {
             uint cc = idx & 3u;
             uint g = (m0 + row) * R8 + k8 + cc;
             uvec4 vh = a[g];
+#if TERMS >= 2
             uvec4 vl = a[loA + g];
             ST8(sAh, row * AH + cc * 8u, vh);
             ST8(sAl, row * AH + cc * 8u, vl);
+#endif
         }
         for (uint i = 0u; i < 2u; i++) {
             uint idx = tid + i * 256u;
@@ -98,17 +115,25 @@ void main() {
             uint cc = idx & 3u;
             uint gw = (j0 + row) * R8 + k8 + cc;
             uvec4 uh = w[gw];
+#if TERMS >= 3
             uvec4 ul = w[loW + gw];
+#endif
             ST8(sBh, row * AH + cc * 8u, uh);
+#if TERMS >= 3
             ST8(sBl, row * AH + cc * 8u, ul);
+#endif
 #else
             uint rr = idx >> 4u;
             uint c2 = idx & 15u;
             uint gw = (k0 + rr) * (p.J >> 3u) + (j0 >> 3u) + c2;
             uvec4 uh = w[gw];
+#if TERMS >= 3
             uvec4 ul = w[loW + gw];
+#endif
             ST8(sBh, rr * BH + c2 * 8u, uh);
+#if TERMS >= 3
             ST8(sBl, rr * BH + c2 * 8u, ul);
+#endif
 #endif
         }
         barrier();
@@ -120,21 +145,25 @@ void main() {
 #ifdef BT
             coopMatLoad(bh0, sBh, (wj * 32u) * AH + kk, AH, gl_CooperativeMatrixLayoutColumnMajor);
             coopMatLoad(bh1, sBh, (wj * 32u + 16u) * AH + kk, AH, gl_CooperativeMatrixLayoutColumnMajor);
+#if TERMS >= 3
             coopMatLoad(bl0, sBl, (wj * 32u) * AH + kk, AH, gl_CooperativeMatrixLayoutColumnMajor);
             coopMatLoad(bl1, sBl, (wj * 32u + 16u) * AH + kk, AH, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
 #else
             coopMatLoad(bh0, sBh, kk * BH + wj * 32u, BH, gl_CooperativeMatrixLayoutRowMajor);
             coopMatLoad(bh1, sBh, kk * BH + wj * 32u + 16u, BH, gl_CooperativeMatrixLayoutRowMajor);
+#if TERMS >= 3
             coopMatLoad(bl0, sBl, kk * BH + wj * 32u, BH, gl_CooperativeMatrixLayoutRowMajor);
             coopMatLoad(bl1, sBl, kk * BH + wj * 32u + 16u, BH, gl_CooperativeMatrixLayoutRowMajor);
+#endif
 #endif
 #define HROW(I, C0, C1) { \
                 MATA ah; MATA al; \
                 uint mr_ = wm * wmr + (I) * 16u; \
                 coopMatLoad(ah, sAh, mr_ * AH + kk, AH, gl_CooperativeMatrixLayoutRowMajor); \
-                coopMatLoad(al, sAl, mr_ * AH + kk, AH, gl_CooperativeMatrixLayoutRowMajor); \
-                C0 = coopMatMulAdd(ah, bh0, C0); C0 = coopMatMulAdd(al, bh0, C0); C0 = coopMatMulAdd(ah, bl0, C0); \
-                C1 = coopMatMulAdd(ah, bh1, C1); C1 = coopMatMulAdd(al, bh1, C1); C1 = coopMatMulAdd(ah, bl1, C1); }
+                LOAD_AL(al, mr_ * AH + kk) \
+                C0 = coopMatMulAdd(ah, bh0, C0); MMA_AL(C0, al, bh0) MMA_BL(C0, ah, bl0) \
+                C1 = coopMatMulAdd(ah, bh1, C1); MMA_AL(C1, al, bh1) MMA_BL(C1, ah, bl1) }
             HROW(0u, c00, c01);
             HROW(1u, c10, c11);
 #if WTM == 4

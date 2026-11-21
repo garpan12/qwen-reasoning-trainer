@@ -1,0 +1,4 @@
+#version 450
+// matmul_t_h2_cm with 2 MMA term(s) per product (QWEN38_GEMM_TERMS=2).
+#define TERMS 2
+#include "matmul_h2_body.glsl"
