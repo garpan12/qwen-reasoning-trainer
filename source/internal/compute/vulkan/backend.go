@@ -2587,8 +2587,12 @@ func (b *Backend) GatedDeltaNetChunkedBackward(q, k, v, g, beta, state, dOut, dN
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	if err := b.dispatch("gdn_chunk_bwd", []*buffer{tq, tk, tv, tb, td, tn, work, dV, dState, dBeta},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC), scale), g3(ceilDiv(hhSV, 128))); err != nil {
+	bwdName, bwdGroups := "gdn_chunk_bwd", g3(ceilDiv(hhSV, 128))
+	if b.gdnSubgroup() && sv <= 128 && C <= 64 {
+		bwdName, bwdGroups = "gdn_chunk_bwd_sg", g3(ceilDiv(hhSV, 4))
+	}
+	if err := b.dispatch(bwdName, []*buffer{tq, tk, tv, tb, td, tn, work, dV, dState, dBeta},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC), scale), bwdGroups); err != nil {
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
