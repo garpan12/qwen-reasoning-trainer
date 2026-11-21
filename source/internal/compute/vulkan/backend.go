@@ -2138,8 +2138,8 @@ func (b *Backend) GatedDeltaNet(q, k, v, g, beta, state compute.Buffer) (compute
 		return nil, nil, err
 	}
 	scale := float32(1 / math.Sqrt(float64(sv)))
-	groups := [3]uint32{ceilDiv(uint32(h*sv), 128), 1, 1}
-	if err := b.dispatch("gated_delta_net", []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
+	gdnName, groups := b.gdnForwardDispatch(h, sv)
+	if err := b.dispatch(gdnName, []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
 		push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda, uint32(h)), groups); err != nil {
 		b.Free(out)
 		b.Free(ns)
@@ -2200,8 +2200,8 @@ func (b *Backend) GatedDeltaNetQK(q, k, v, g, beta, state compute.Buffer, nK int
 		return nil, nil, err
 	}
 	scale := float32(1 / math.Sqrt(float64(sv)))
-	groups := [3]uint32{ceilDiv(uint32(h*sv), 128), 1, 1}
-	if err := b.dispatch("gated_delta_net", []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
+	gdnName, groups := b.gdnForwardDispatch(h, sv)
+	if err := b.dispatch(gdnName, []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
 		push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda, uint32(nK)), groups); err != nil {
 		b.Free(out)
 		b.Free(ns)
@@ -2854,6 +2854,22 @@ func (b *Backend) dequantElem(wb *buffer, typ string, k, n int) (*buffer, error)
 		return nil, err
 	}
 	return out, nil
+}
+
+// gdnSubgroup reports whether the GatedDeltaNet forward uses the
+// subgroup-parallel gated_delta_net_sg kernel (one 32-lane subgroup per state
+// row instead of one lane). NVIDIA only; QWEN38_GDN_SG=0 keeps the old kernel.
+func (b *Backend) gdnSubgroup() bool {
+	return b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_GDN_SG") != "0"
+}
+
+// gdnForwardDispatch picks the GatedDeltaNet forward kernel and its grid for
+// h heads of s_v state rows.
+func (b *Backend) gdnForwardDispatch(h, sv int) (string, [3]uint32) {
+	if b.gdnSubgroup() {
+		return "gated_delta_net_sg", [3]uint32{ceilDiv(uint32(h*sv), 4), 1, 1}
+	}
+	return "gated_delta_net", [3]uint32{ceilDiv(uint32(h*sv), 128), 1, 1}
 }
 
 // coopMatGEMM reports whether the tensor-core *_cm_* fused GEMMs are used. They
