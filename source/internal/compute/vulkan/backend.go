@@ -2449,13 +2449,17 @@ func (b *Backend) GatedDeltaNetChunkedForwardAux(q, k, v, g, beta, state compute
 		b.Free(work)
 		return nil, zero, err
 	}
-	if err := b.dispatch("gdn_chunk_ab", []*buffer{tk, tq, work},
+	if err := b.dispatch(b.gdnChunkName("gdn_chunk_ab", sv, L.C), []*buffer{tk, tq, work},
 		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), g3(hhNC)); err != nil {
 		b.Free(work)
 		return nil, zero, err
 	}
-	if err := b.dispatch("gdn_chunk_fwd", []*buffer{tk, tv, tb, ts, work},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), g3(ceilDiv(hhSV, 128))); err != nil {
+	fwdName, fwdGroups := "gdn_chunk_fwd", g3(ceilDiv(hhSV, 128))
+	if n := b.gdnChunkName("gdn_chunk_fwd", sv, L.C); n != "gdn_chunk_fwd" {
+		fwdName, fwdGroups = n, g3(ceilDiv(hhSV, 4))
+	}
+	if err := b.dispatch(fwdName, []*buffer{tk, tv, tb, ts, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), fwdGroups); err != nil {
 		b.Free(work)
 		return nil, zero, err
 	}
@@ -2577,13 +2581,17 @@ func (b *Backend) GatedDeltaNetChunkedBackward(q, k, v, g, beta, state, dOut, dN
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	if err := b.dispatch("gdn_chunk_ab", []*buffer{tk, tq, work},
+	if err := b.dispatch(b.gdnChunkName("gdn_chunk_ab", sv, C), []*buffer{tk, tq, work},
 		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), g3(hhNC)); err != nil {
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	if err := b.dispatch("gdn_chunk_fwd", []*buffer{tk, tv, tb, ts, work},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), g3(ceilDiv(hhSV, 128))); err != nil {
+	fwdName, fwdGroups := "gdn_chunk_fwd", g3(ceilDiv(hhSV, 128))
+	if n := b.gdnChunkName("gdn_chunk_fwd", sv, C); n != "gdn_chunk_fwd" {
+		fwdName, fwdGroups = n, g3(ceilDiv(hhSV, 4))
+	}
+	if err := b.dispatch(fwdName, []*buffer{tk, tv, tb, ts, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), fwdGroups); err != nil {
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
@@ -2936,6 +2944,15 @@ func (b *Backend) dequantElem(wb *buffer, typ string, k, n int) (*buffer, error)
 // row instead of one lane). NVIDIA only; QWEN38_GDN_SG=0 keeps the old kernel.
 func (b *Backend) gdnSubgroup() bool {
 	return b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_GDN_SG") != "0"
+}
+
+// gdnChunkName returns the subgroup (_sg) variant of a chunked GatedDeltaNet
+// pass when gdnSubgroup is on and the shapes fit it (S_v <= 128, C <= 64).
+func (b *Backend) gdnChunkName(name string, sv, c int) string {
+	if b.gdnSubgroup() && sv <= 128 && c <= 64 {
+		return name + "_sg"
+	}
+	return name
 }
 
 // gdnForwardDispatch picks the GatedDeltaNet forward kernel and its grid for

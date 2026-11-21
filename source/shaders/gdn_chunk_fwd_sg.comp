@@ -1,0 +1,118 @@
+#version 450
+
+// Chunked GatedDeltaNet, pass 3 (forward solve, boundary states, deltas),
+// subgroup-parallel variant of gdn_chunk_fwd.comp: same bindings, push constants
+// and results (to rounding). One 32-lane subgroup per (head, state row j), 4 rows
+// per workgroup; lane l owns state elements i = l + 32*r (S_v <= 128) and chunk
+// positions pp = l + 32*m (C <= 64). Requires 32-lane subgroups: NVIDIA only.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define MAXR 4
+#define MAXP 2
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly buffer K { float kv[];   };
+layout(binding = 1) readonly buffer V { float vv[];   };
+layout(binding = 2) readonly buffer B { float betav[]; };
+layout(binding = 3) readonly buffer S { float statev[]; };
+layout(binding = 4)          buffer W { float w[];    };
+
+layout(push_constant) uniform P {
+    uint sv;
+    uint h;
+    uint nTok;
+    uint C;
+    uint NC;
+} p;
+
+shared float sdel[4][32u * MAXP];
+
+void main() {
+    uint sg = gl_SubgroupID;
+    uint rowId = gl_WorkGroupID.x * 4u + sg;
+    uint lane = gl_SubgroupInvocationID;
+    uint hh = rowId / p.sv;
+    uint j = rowId - hh * p.sv;
+    if (hh >= p.h || p.sv > 32u * MAXR || p.C > 32u * MAXP) {
+        return;  // uniform across the subgroup
+    }
+
+    uint offA = p.h * p.NC * p.C * p.sv;
+    uint offB = offA + p.h * p.NC * p.C * p.C;
+    uint offDelta = offB + p.h * p.NC * p.C * p.C;
+    uint offBnd = offDelta + p.h * p.NC * p.C * p.sv;
+
+    float Sc[MAXR];
+    float dl[MAXP];
+
+    uint sb = hh * p.sv * p.sv + j * p.sv;
+    for (uint r = 0u; r < MAXR; r++) {
+        uint i = lane + 32u * r;
+        Sc[r] = 0.0;
+        if (i < p.sv) {
+            Sc[r] = statev[sb + i];
+            w[offBnd + ((hh * (p.NC + 1u)) * p.sv + j) * p.sv + i] = Sc[r];
+        }
+    }
+
+    for (uint c = 0u; c < p.NC; c++) {
+        uint t0 = c * p.C;
+        uint clen = min(p.C, p.nTok - t0);
+        uint gcBase = ((hh * p.NC + c) * p.C) * p.sv;
+        uint aBase = offA + (hh * p.NC + c) * p.C * p.C;
+        uint dBase = offDelta + ((hh * p.NC + c) * p.C) * p.sv;
+
+        for (uint m = 0u; m < MAXP; m++) {
+            dl[m] = 0.0;
+        }
+        for (uint rt = 0u; rt < clen; rt++) {
+            uint kb = ((t0 + rt) * p.h + hh) * p.sv;
+            float b = betav[(t0 + rt) * p.h + hh];
+            // rhs = b * (v_j - sum_i Sc_i e_i k_i) - b * sum_{pp<rt} A[pp,rt] delta_pp
+            float part = 0.0;
+            for (uint r = 0u; r < MAXR; r++) {
+                uint i = lane + 32u * r;
+                if (i < p.sv) {
+                    part += Sc[r] * exp(w[gcBase + rt * p.sv + i]) * kv[kb + i];
+                }
+            }
+            for (uint m = 0u; m < MAXP; m++) {
+                uint pp = lane + 32u * m;
+                if (pp < rt) {
+                    part += w[aBase + pp * p.C + rt] * dl[m];
+                }
+            }
+            float rhs = b * (vv[kb + j] - subgroupAdd(part));
+            for (uint m = 0u; m < MAXP; m++) {
+                if (lane + 32u * m == rt) {
+                    dl[m] = rhs;
+                }
+            }
+            if (lane == 0u) {
+                w[dBase + rt * p.sv + j] = rhs;
+                sdel[sg][rt] = rhs;
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        uint last = clen - 1u;
+        for (uint r = 0u; r < MAXR; r++) {
+            uint i = lane + 32u * r;
+            if (i < p.sv) {
+                float gl = w[gcBase + last * p.sv + i];
+                float acc = exp(gl) * Sc[r];
+                for (uint pp = 0u; pp < clen; pp++) {
+                    float kp = kv[((t0 + pp) * p.h + hh) * p.sv + i];
+                    acc += exp(gl - w[gcBase + pp * p.sv + i]) * kp * sdel[sg][pp];
+                }
+                Sc[r] = acc;
+                w[offBnd + ((hh * (p.NC + 1u) + (c + 1u)) * p.sv + j) * p.sv + i] = acc;
+            }
+        }
+        subgroupBarrier();  // sdel is rewritten by the next chunk
+    }
+}

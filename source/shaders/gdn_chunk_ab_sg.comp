@@ -1,0 +1,80 @@
+#version 450
+
+// Chunked GatedDeltaNet, pass 2 (C x C coupling matrices), subgroup-parallel
+// variant of gdn_chunk_ab.comp: same bindings, push constants and results (to
+// rounding). One 256-invocation workgroup per (head, chunk); its 8 subgroups take
+// rows r round-robin, and each 128-long dot product over i is split across the
+// 32 lanes (i = lane + 32*q, S_v <= 128) and reduced with subgroupAdd.
+//   A[p,r]  = sum_i exp(Gc_r[i]-Gc_p[i]) k_p[i] k_r[i]   (p < r)
+//   Bt[r,p] = sum_i exp(Gc_r[i]-Gc_p[i]) k_p[i] q_r[i]   (p <= r)
+// Requires 32-lane subgroups: NVIDIA only.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define MAXR 4
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer K { float kv[]; };
+layout(binding = 1) readonly buffer Q { float qv[]; };
+layout(binding = 2)          buffer W { float w[];  };
+
+layout(push_constant) uniform P {
+    uint sv;
+    uint h;
+    uint nTok;
+    uint C;
+    uint NC;
+} p;
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    uint gid = gl_WorkGroupID.x; // hh * NC + c
+    uint hh = gid / p.NC;
+    uint c = gid - hh * p.NC;
+    uint t0 = c * p.C;
+    uint clen = min(p.C, p.nTok - t0);
+    if (p.sv > 32u * MAXR) {
+        return;
+    }
+    uint gcBase = ((hh * p.NC + c) * p.C) * p.sv;
+    uint offA = p.h * p.NC * p.C * p.sv;
+    uint offB = offA + p.h * p.NC * p.C * p.C;
+    uint aBase = offA + (hh * p.NC + c) * p.C * p.C;
+    uint bBase = offB + (hh * p.NC + c) * p.C * p.C;
+    for (uint r = gl_SubgroupID; r < clen; r += gl_NumSubgroups) {
+        uint rb = ((t0 + r) * p.h + hh) * p.sv;
+        float gr[MAXR];
+        float kr[MAXR];
+        float qr[MAXR];
+        for (uint q = 0u; q < MAXR; q++) {
+            uint i = lane + 32u * q;
+            bool ok = i < p.sv;
+            gr[q] = ok ? w[gcBase + r * p.sv + i] : 0.0;
+            kr[q] = ok ? kv[rb + i] : 0.0;
+            qr[q] = ok ? qv[rb + i] : 0.0;
+        }
+        for (uint pp = 0u; pp <= r; pp++) {
+            uint pb = ((t0 + pp) * p.h + hh) * p.sv;
+            float pa = 0.0;
+            float pbq = 0.0;
+            for (uint q = 0u; q < MAXR; q++) {
+                uint i = lane + 32u * q;
+                if (i < p.sv) {
+                    float ck = exp(gr[q] - w[gcBase + pp * p.sv + i]) * kv[pb + i];
+                    pa += ck * kr[q];
+                    pbq += ck * qr[q];
+                }
+            }
+            float sa = subgroupAdd(pa);
+            float sb = subgroupAdd(pbq);
+            if (lane == 0u) {
+                if (pp < r) {
+                    w[aBase + pp * p.C + r] = sa;
+                }
+                w[bBase + r * p.C + pp] = sb;
+            }
+        }
+    }
+}
