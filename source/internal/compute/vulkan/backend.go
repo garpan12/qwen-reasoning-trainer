@@ -1473,9 +1473,13 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 		shader = "attention_naive"
 	}
 	// Chunk the dispatch to stay below the per-dimension group limit: one
-	// workgroup per query.
+	// workgroup per query (attention_tile: per block of 16 queries).
 	const maxPerDispatch = 65535
 	total := uint32(nHead * nTok)
+	if headDim == 256 && b.attnTile() && nHeadKV > 0 && nHead%nHeadKV == 0 {
+		shader = "attention_tile"
+		total = uint32(nHead) * ceilDiv(uint32(nTok), 16)
+	}
 	for start := uint32(0); start < total; start += maxPerDispatch {
 		chunk := total - start
 		if chunk > maxPerDispatch {
@@ -1963,13 +1967,19 @@ func (b *Backend) AttentionBackward(q, k, v, dOut compute.Buffer, nHead, nHeadKV
 		defer b.Free(pds)
 		const maxPerDispatch = 65535
 		total := uint32(nHead * nQ)
+		dqShader := "attn_back_dq_tile"
+		if hd == 256 && b.attnTile() && nHeadKV > 0 && nHead%nHeadKV == 0 {
+			// 16 queries per workgroup sharing K/V tiles.
+			dqShader = "attn_back_dq_q16"
+			total = uint32(nHead) * ceilDiv(uint32(nQ), 16)
+		}
 		for start := uint32(0); start < total; start += maxPerDispatch {
 			chunk := total - start
 			if chunk > maxPerDispatch {
 				chunk = maxPerDispatch
 			}
 			pc := push(uint32(hd), uint32(nQ), uint32(nKV), uint32(nHead), uint32(nHeadKV), c, scale, start)
-			if err := b.dispatch("attn_back_dq_tile", []*buffer{qb, kb, vb, db, stats, dQ, pds}, pc, [3]uint32{chunk, 1, 1}); err != nil {
+			if err := b.dispatch(dqShader, []*buffer{qb, kb, vb, db, stats, dQ, pds}, pc, [3]uint32{chunk, 1, 1}); err != nil {
 				freeOut()
 				return nil, nil, nil, err
 			}
@@ -2945,6 +2955,13 @@ func (b *Backend) dequantElem(wb *buffer, typ string, k, n int) (*buffer, error)
 		return nil, err
 	}
 	return out, nil
+}
+
+// attnTile reports whether the square attention forward and backward use the
+// query-tiled attention_tile / attn_back_dq_q16 kernels (headDim 256, 16
+// queries per workgroup sharing K/V tiles). NVIDIA only; QWEN38_ATTN_TILE=0 keeps the one-query kernel.
+func (b *Backend) attnTile() bool {
+	return b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_ATTN_TILE") != "0"
 }
 
 // skinnyGEMM reports whether float32 GEMMs with a <= 16-wide output (the rank-16

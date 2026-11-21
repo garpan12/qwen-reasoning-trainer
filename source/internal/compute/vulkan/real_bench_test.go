@@ -183,7 +183,10 @@ func TestVulkanAttentionTileParity(t *testing.T) {
 		{8, 4, 2, 7, true},
 		{8, 4, 2, 7, false},
 		{256, 24, 4, 128, true},
-		{4, 2, 1, 1100, true}, // spans two TILE=1024 passes
+		{256, 6, 2, 37, true}, // attention_tile: partial query/key tiles
+		{256, 6, 2, 37, false},
+		{256, 4, 1, 1030, true}, // attention_tile: many key tiles
+		{4, 2, 1, 1100, true},   // spans two TILE=1024 passes
 	}
 	for _, tc := range cases {
 		q := autograd.Random(41, 1.0, tc.hd, tc.nh, tc.T)
