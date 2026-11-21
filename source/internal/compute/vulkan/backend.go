@@ -2800,6 +2800,10 @@ const vendorNVIDIA = 0x10DE
 // bandwidth and was 44% of decode GPU time, while gemv_row_q5_k runs ~3x faster
 // (decode 11.5 -> 14.7 tok/s). QWEN38_Q5K_ROW=1/0 forces either choice.
 func (b *Backend) rowGEMVShader(typ quant.Type) (string, bool) {
+	// IQ4_NL has only the subgroup row kernel (gemv_row_iq4_nl_sg).
+	if typ == quant.TypeIQ4_NL {
+		return "gemv_row_iq4_nl", b.gemvSubgroup()
+	}
 	name, ok := gemvRowShaders[typ]
 	if ok && typ == quant.TypeQ5_K {
 		switch os.Getenv("QWEN38_Q5K_ROW") {

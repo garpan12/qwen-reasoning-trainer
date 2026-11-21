@@ -3,14 +3,14 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// Row-cooperative Q4_K GEMV: y[n] = sum_k dequant(W[n,k]) * x[k].
-// _sg variant: one 32-lane subgroup per row (4 rows per workgroup), subgroupAdd reduction.
-// One 64-lane workgroup computes one output row. Lanes split the K reduction
-// into 64-value groups so both 32-value scales of a group share one word load.
+// Row-cooperative Q4_K GEMV, coalesced: y[n] = sum_k dequant(W[n,k]) * x[k].
+// One 32-lane subgroup per output row (4 rows per 128-invocation workgroup).
+// Lanes take consecutive 16-byte chunks of the row's quant data, so each warp
+// load is contiguous; the subgroupAdd gives y[n].
 
 layout(local_size_x = 128) in;
 
-layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 0) readonly  buffer W { uvec4 data[]; };
 layout(binding = 1) readonly  buffer X { vec4 x[]; };
 layout(binding = 2) writeonly buffer Y { float y[]; };
 
@@ -20,24 +20,23 @@ layout(push_constant) uniform P {
     uint rowBase;
 } p;
 
-#define LS 32u
+// Byte i of a 16-byte block header.
+uint hb(uvec4 h, uint i) { return (h[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
 
-uint getb(uint o) { return (data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
-float f16(uint o) { return unpackHalf2x16(getb(o) | (getb(o + 1u) << 8u)).x; }
-
-void scaleMin(uint base, uint s, out float dl, out float ml) {
-    float d = f16(base);
-    float mn = f16(base + 2u);
+// Scale and min of sub-block s (0..7) from a Q4_K/Q5_K header (d, dmin, 12
+// packed 6-bit scales), as in the get_scale_min_k4 layout.
+void scaleMin(uvec4 h, uint s, out float dl, out float ml) {
+    vec2 dm = unpackHalf2x16(h.x);
     uint sc, m;
     if (s < 4u) {
-        sc = getb(base + 4u + s) & 63u;
-        m = getb(base + 8u + s) & 63u;
+        sc = hb(h, 4u + s) & 63u;
+        m = hb(h, 8u + s) & 63u;
     } else {
-        sc = (getb(base + 8u + s) & 0xFu) | ((getb(base + s) >> 6u) << 4u);
-        m = (getb(base + 8u + s) >> 4u) | ((getb(base + 4u + s) >> 6u) << 4u);
+        sc = (hb(h, 8u + s) & 0xFu) | ((hb(h, s) >> 6u) << 4u);
+        m = (hb(h, 8u + s) >> 4u) | ((hb(h, 4u + s) >> 6u) << 4u);
     }
-    dl = d * float(sc);
-    ml = mn * float(m);
+    dl = dm.x * float(sc);
+    ml = dm.y * float(m);
 }
 
 void main() {
@@ -46,29 +45,28 @@ void main() {
     if (n >= p.N) {
         return;
     }
+    // Block = 144 bytes = 9 uvec4: header, then 8 chunks of qs. Chunk c holds
+    // qs bytes 16c..16c+15 = bytes j = 16*(c&1).. of group g = c>>1; byte j's
+    // low nibble is element g*64 + j, its high nibble element g*64 + 32 + j.
     uint bpr = p.K / 256u;
+    uint rowU4 = n * bpr * 9u;
     float acc = 0.0;
-    for (uint gi = lane; gi < bpr * 4u; gi += LS) {
-        uint b = gi >> 2u;
-        uint g = gi & 3u;
-        uint base = (n * bpr + b) * 144u;
+    for (uint u = lane; u < bpr * 8u; u += 32u) {
+        uint b = u >> 3u;
+        uint c = u & 7u;
+        uint g = c >> 1u;
+        uvec4 h = data[rowU4 + b * 9u];
+        uvec4 q = data[rowU4 + b * 9u + 1u + c];
         float dl0, ml0, dl1, ml1;
-        scaleMin(base, g * 2u, dl0, ml0);
-        scaleMin(base, g * 2u + 1u, dl1, ml1);
-        vec4 vml0 = vec4(ml0);
-        vec4 vml1 = vec4(ml1);
-        uint qw = (base + 16u + g * 32u) >> 2u;
-        uint x0 = (b * 256u + g * 64u) >> 2u;
-        uint x1 = x0 + 8u;
-        for (uint i = 0u; i < 8u; i++) {
-            uint w = data[qw + i];
-            uvec4 lo = uvec4(
-                w & 0xFu, (w >> 8u) & 0xFu, (w >> 16u) & 0xFu, (w >> 24u) & 0xFu);
-            uvec4 hi = uvec4(
-                (w >> 4u) & 0xFu, (w >> 12u) & 0xFu,
-                (w >> 20u) & 0xFu, (w >> 28u) & 0xFu);
-            acc += dot(dl0 * vec4(float(lo.x), float(lo.y), float(lo.z), float(lo.w)) - vml0, x[x0 + i]);
-            acc += dot(dl1 * vec4(float(hi.x), float(hi.y), float(hi.z), float(hi.w)) - vml1, x[x1 + i]);
+        scaleMin(h, g * 2u, dl0, ml0);
+        scaleMin(h, g * 2u + 1u, dl1, ml1);
+        uint x0 = (b * 256u + g * 64u) / 4u + (c & 1u) * 4u;
+        for (uint i = 0u; i < 4u; i++) {
+            uint w = q[i];
+            vec4 lo = vec4(float(w & 0xFu), float((w >> 8u) & 0xFu), float((w >> 16u) & 0xFu), float((w >> 24u) & 0xFu));
+            vec4 hi = vec4(float((w >> 4u) & 0xFu), float((w >> 12u) & 0xFu), float((w >> 20u) & 0xFu), float(w >> 28u));
+            acc += dot(dl0 * lo - vec4(ml0), x[x0 + i]);
+            acc += dot(dl1 * hi - vec4(ml1), x[x0 + 8u + i]);
         }
     }
     acc = subgroupAdd(acc);
