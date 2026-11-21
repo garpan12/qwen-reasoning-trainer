@@ -76,20 +76,20 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 	var reserved uint64
 	reuse := 0
 	if usePrefix {
-		if c := e.takePrefix(); c != nil {
-			if c.capacity >= capacity && len(c.tokens) > 0 && len(c.tokens) <= split && hasTokenPrefix(prompt, c.tokens) {
-				st, reserved, reuse = c.st, c.reserved, len(c.tokens)
-			} else {
-				e.dropPrefix(c)
-			}
+		if c := e.takePrefix(prompt, split, capacity); c != nil {
+			st, reserved, reuse = c.st, c.reserved, len(c.tokens)
 		}
 	}
 	if st == nil {
 		if _, ok := e.Backend.(qwen38.KVCacheBackend); ok {
 			need := EstimateKVBytes(e.Cfg, capacity, e.kvType)
-			if !e.reserveKV(need) {
-				return nil, fmt.Errorf("inference: KV cache request %s exceeds remaining budget %s",
-					FormatBytes(need), FormatBytes(e.kvBudget))
+			for !e.reserveKV(need) {
+				// Cached prefixes hold KV reservations; evict them before
+				// refusing the request.
+				if !usePrefix || !e.evictOldestPrefix() {
+					return nil, fmt.Errorf("inference: KV cache request %s exceeds remaining budget %s",
+						FormatBytes(need), FormatBytes(e.kvBudget))
+				}
 			}
 			reserved = need
 		}
@@ -120,7 +120,7 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 		e.releaseKV(reserved)
 	}()
 	if usePrefix {
-		logPrefix(reuse, len(prompt))
+		logPrefix(reuse, len(prompt), e.cachedPrefixes())
 	}
 	chunk := e.prefillChunk
 	if chunk <= 0 || chunk > len(prompt) {
@@ -174,6 +174,14 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 
 	for i := 0; i < maxTokens; i++ {
 		if err := ctx.Err(); err != nil {
+			// The client went away (e.g. timed out during a long prefill).
+			// Keep the prefilled prefix so its retry doesn't start over.
+			if usePrefix && snapped {
+				if rerr := compute.Run(e.Backend, st.SpecRestore); rerr == nil {
+					e.putPrefix(&prefixEntry{st: st, tokens: append([]int32(nil), prompt[:split]...), capacity: capacity, reserved: reserved})
+					keepState = true
+				}
+			}
 			return nil, err
 		}
 		if e.contextLen > 0 && len(prompt)+len(generated) >= e.contextLen {

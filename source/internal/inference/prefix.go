@@ -3,6 +3,7 @@ package inference
 import (
 	"log"
 	"os"
+	"strconv"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/compute"
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/model/qwen38"
@@ -24,25 +25,88 @@ type prefixEntry struct {
 // QWEN38_PREFIX_CACHE=0 disables it.
 func prefixCacheEnabled() bool { return os.Getenv("QWEN38_PREFIX_CACHE") != "0" }
 
-// takePrefix removes and returns the cached entry (nil if none), so a request
-// owns it exclusively.
-func (e *Engine) takePrefix() *prefixEntry {
+// prefixSlots is how many request states the prefix cache keeps.
+// QWEN38_PREFIX_SLOTS overrides the default of 4.
+func prefixSlots() int {
+	if n, err := strconv.Atoi(os.Getenv("QWEN38_PREFIX_SLOTS")); err == nil && n >= 1 {
+		return n
+	}
+	return 4
+}
+
+// takePrefix removes and returns the cached entry whose tokens are the longest
+// prefix of prompt not past limit, with at least capacity (nil if none), so the
+// request owns it exclusively.
+func (e *Engine) takePrefix(prompt []int32, limit, capacity int) *prefixEntry {
 	e.prefixMu.Lock()
 	defer e.prefixMu.Unlock()
-	c := e.prefix
-	e.prefix = nil
+	best := -1
+	for i, c := range e.prefixes {
+		if len(c.tokens) == 0 || len(c.tokens) > limit || c.capacity < capacity || !hasTokenPrefix(prompt, c.tokens) {
+			continue
+		}
+		if best < 0 || len(c.tokens) > len(e.prefixes[best].tokens) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return nil
+	}
+	c := e.prefixes[best]
+	e.prefixes = append(e.prefixes[:best], e.prefixes[best+1:]...)
 	return c
 }
 
-// putPrefix caches c, dropping any entry another request stored meanwhile.
+// putPrefix caches c as the most recently used entry. Entries that c extends
+// are redundant and dropped, as are the least recently used ones beyond
+// prefixSlots.
 func (e *Engine) putPrefix(c *prefixEntry) {
 	e.prefixMu.Lock()
-	old := e.prefix
-	e.prefix = c
-	e.prefixMu.Unlock()
-	if old != nil {
-		e.dropPrefix(old)
+	keep := []*prefixEntry{c}
+	var drop []*prefixEntry
+	for _, o := range e.prefixes {
+		if hasTokenPrefix(c.tokens, o.tokens) {
+			drop = append(drop, o)
+		} else {
+			keep = append(keep, o)
+		}
 	}
+	for len(keep) > prefixSlots() {
+		drop = append(drop, keep[len(keep)-1])
+		keep = keep[:len(keep)-1]
+	}
+	e.prefixes = keep
+	e.prefixMu.Unlock()
+	for _, o := range drop {
+		e.dropPrefix(o)
+	}
+}
+
+// evictOldestPrefix drops the least recently used cached entry; false if none.
+func (e *Engine) evictOldestPrefix() bool {
+	e.prefixMu.Lock()
+	if len(e.prefixes) == 0 {
+		e.prefixMu.Unlock()
+		return false
+	}
+	c := e.prefixes[len(e.prefixes)-1]
+	e.prefixes = e.prefixes[:len(e.prefixes)-1]
+	e.prefixMu.Unlock()
+	e.dropPrefix(c)
+	return true
+}
+
+// dropAllPrefixes frees every cached entry.
+func (e *Engine) dropAllPrefixes() {
+	for e.evictOldestPrefix() {
+	}
+}
+
+// cachedPrefixes reports how many entries are cached.
+func (e *Engine) cachedPrefixes() int {
+	e.prefixMu.Lock()
+	defer e.prefixMu.Unlock()
+	return len(e.prefixes)
 }
 
 // dropPrefix frees a cached state and its KV reservation.
@@ -80,6 +144,6 @@ func hasTokenPrefix(s, prefix []int32) bool {
 	return true
 }
 
-func logPrefix(reused, total int) {
-	log.Printf("prefix cache: reused %d of %d prompt tokens, prefilling %d", reused, total, total-reused)
+func logPrefix(reused, total, cached int) {
+	log.Printf("prefix cache: reused %d of %d prompt tokens, prefilling %d (%d other cached)", reused, total, total-reused, cached)
 }

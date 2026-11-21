@@ -64,9 +64,10 @@ type Engine struct {
 	imStart      int32
 	hasImStart   bool
 
-	// prefix is the cached state of the last request (see prefixEntry).
+	// prefixes are cached request states, most recently used first (see
+	// prefixEntry).
 	prefixMu sync.Mutex
-	prefix   *prefixEntry
+	prefixes []*prefixEntry
 
 	kvBudget uint64
 	kvLimit  bool
@@ -255,9 +256,7 @@ func (e *Engine) Close() error {
 	e.close.Do(func() {
 		e.life.Lock()
 		e.closed = true
-		if c := e.takePrefix(); c != nil {
-			e.dropPrefix(c)
-		}
+		e.dropAllPrefixes()
 		if e.Model != nil {
 			e.Model.FreeDevice()
 		}
