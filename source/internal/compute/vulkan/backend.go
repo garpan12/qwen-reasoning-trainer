@@ -65,8 +65,9 @@ func envInt(key string, def int) int {
 
 // Split-plan tuning knobs, overridable for benchmarks.
 var (
-	splitTargetWorkGroups = envInt("QWEN38_SPLIT_TARGET", 256)
-	splitMinKeysPerSplit  = envInt("QWEN38_SPLIT_MIN_KEYS", 256)
+	splitTargetWorkGroups = envInt("QWEN38_SPLIT_TARGET", 1024)
+	splitMinKeysPerSplit  = envInt("QWEN38_SPLIT_MIN_KEYS", 64)
+	splitMaxSplits        = envInt("QWEN38_SPLIT_MAX", 512)
 )
 
 // matmulWShaders maps a quantized type to its fused dequantize+GEMM shader
@@ -1551,7 +1552,7 @@ func cachedSplitPlan(nKV, nQ, nHead, nHeadKV int) (keysPerSplit, splits int, ok 
 	// merges query heads, so its natural parallelism is nHeadKV per split
 	// instead of nHead*nQ per split.
 	targetWorkGroups := splitTargetWorkGroups
-	const maxSplits = 128
+	maxSplits := splitMaxSplits
 	minKeysPerSplit := splitMinKeysPerSplit
 	baseGroups := nHead * nQ
 	if nQ == 1 && nHead/nHeadKV == 6 {

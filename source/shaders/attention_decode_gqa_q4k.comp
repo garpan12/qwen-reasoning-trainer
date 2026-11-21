@@ -6,12 +6,17 @@
 // Every K/V element is dequantized once and reused by the whole GQA group
 // instead of once per query head. Outputs per-head partial softmax state for
 // attention_cached_reduce. Requires nQ == 1 and headDim == 256.
+//
+// A Q4_K block (144 bytes) is exactly one 256-dim K or V row: header uvec4
+// (d, dmin, 12 packed 6-bit scales) + 8 uvec4 of nibbles; sub-block s covers
+// elements 32s..32s+31 (group j = s/2: low nibbles of bytes j*32.. for s even,
+// high nibbles for s odd).
 
 layout(local_size_x = 64) in;
 
 layout(binding = 0) readonly  buffer Q { float q[]; };
-layout(binding = 1) readonly  buffer K { uint data[]; } kbuf;
-layout(binding = 2) readonly  buffer V { uint data[]; } vbuf;
+layout(binding = 1) readonly  buffer K { uvec4 d[]; } kbuf;
+layout(binding = 2) readonly  buffer V { uint d[]; } vbuf;
 layout(binding = 3) writeonly buffer O { float o[]; };
 layout(binding = 4) writeonly buffer PART { float part[]; };
 
@@ -33,72 +38,40 @@ layout(push_constant) uniform P {
 #define TILE 64
 #define GROUP 6
 
-shared float qs[GROUP][HD];
+shared vec4 qs4[GROUP][HD / 4];
+shared float qsum[GROUP][8];
 shared float logits[TILE][GROUP];
 shared float mval[GROUP];
 shared float lval[GROUP];
 shared float corr[GROUP];
 
-uint getbK(uint o) { return (kbuf.data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
-uint getbV(uint o) { return (vbuf.data[o >> 2u] >> ((o & 3u) * 8u)) & 0xFFu; }
-float f16K(uint o) { return unpackHalf2x16(getbK(o) | (getbK(o + 1u) << 8u)).x; }
-float f16V(uint o) { return unpackHalf2x16(getbV(o) | (getbV(o + 1u) << 8u)).x; }
+uint hb(uvec4 h, uint i) { return (h[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
 
-void getScaleMinK(uint j, uint s, out uint d, out uint m) {
-    if (j < 4u) {
-        d = getbK(s + j) & 63u;
-        m = getbK(s + j + 4u) & 63u;
-    } else {
-        d = (getbK(s + j + 4u) & 0xFu) | ((getbK(s + j - 4u) >> 6) << 4);
-        m = (getbK(s + j + 4u) >> 4) | ((getbK(s + j) >> 6) << 4);
-    }
-}
-void getScaleMinV(uint j, uint s, out uint d, out uint m) {
-    if (j < 4u) {
-        d = getbV(s + j) & 63u;
-        m = getbV(s + j + 4u) & 63u;
-    } else {
-        d = (getbV(s + j + 4u) & 0xFu) | ((getbV(s + j - 4u) >> 6) << 4);
-        m = (getbV(s + j + 4u) >> 4) | ((getbV(s + j) >> 6) << 4);
-    }
-}
-
-float dequantK(uint token, uint kv, uint d) {
-    uint blk = kv * p.capacity + token;
-    uint idx = d % 256u;
-    uint base = blk * 144u;
-    uint sbase = base + 4u;
-    uint qbase = base + 16u;
-    float dd = f16K(base);
-    float mn = f16K(base + 2u);
-    uint j = idx / 64u;
-    uint r = idx % 64u;
-    uint is = j * 2u + r / 32u;
-    uint l = r % 32u;
+// Scale and min of sub-block s (0..7) of a Q4_K header.
+void scaleMin(uvec4 h, uint s, out float dl, out float ml) {
+    vec2 dm = unpackHalf2x16(h.x);
     uint sc, m;
-    getScaleMinK(is, sbase, sc, m);
-    uint qv = getbK(qbase + j * 32u + l);
-    uint val = (r < 32u) ? (qv & 0xFu) : (qv >> 4u);
-    return dd * float(sc) * float(val) - mn * float(m);
+    if (s < 4u) {
+        sc = hb(h, 4u + s) & 63u;
+        m = hb(h, 8u + s) & 63u;
+    } else {
+        sc = (hb(h, 8u + s) & 0xFu) | ((hb(h, s) >> 6u) << 4u);
+        m = (hb(h, 8u + s) >> 4u) | ((hb(h, 4u + s) >> 6u) << 4u);
+    }
+    dl = dm.x * float(sc);
+    ml = dm.y * float(m);
 }
 
-float dequantV(uint token, uint kv, uint d) {
-    uint blk = kv * p.capacity + token;
-    uint idx = d % 256u;
-    uint base = blk * 144u;
-    uint sbase = base + 4u;
-    uint qbase = base + 16u;
-    float dd = f16V(base);
-    float mn = f16V(base + 2u);
-    uint j = idx / 64u;
-    uint r = idx % 64u;
-    uint is = j * 2u + r / 32u;
-    uint l = r % 32u;
-    uint sc, m;
-    getScaleMinV(is, sbase, sc, m);
-    uint qv = getbV(qbase + j * 32u + l);
-    uint val = (r < 32u) ? (qv & 0xFu) : (qv >> 4u);
-    return dd * float(sc) * float(val) - mn * float(m);
+// V elements idx and idx+1 (idx even) of the block starting at uint word w0.
+vec2 dequantV2(uint w0, uvec4 h, uint idx) {
+    uint j = idx >> 6u;
+    uint r = idx & 63u;
+    uint l = r & 31u;
+    uint word = vbuf.d[w0 + 4u + j * 8u + (l >> 2u)] >> ((l & 3u) * 8u);
+    uint shift = (r < 32u) ? 0u : 4u;
+    float dl, ml;
+    scaleMin(h, j * 2u + (r >> 5u), dl, ml);
+    return vec2(dl * float((word >> shift) & 0xFu) - ml, dl * float((word >> (8u + shift)) & 0xFu) - ml);
 }
 
 void main() {
@@ -123,9 +96,19 @@ void main() {
 
     for (uint g = 0u; g < GROUP; g++) {
         uint h = kv * GROUP + g;
-        for (uint d = lane; d < HD; d += LS) {
-            qs[g][d] = q[h * HD + d];
+        uint qb = h * HD + lane * 4u;
+        qs4[g][lane] = vec4(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]);
+    }
+    barrier();
+    if (lane < GROUP * 8u) {
+        uint g = lane >> 3u;
+        uint s = lane & 7u;
+        float t = 0.0;
+        for (uint i = 0u; i < 8u; i++) {
+            vec4 v = qs4[g][s * 8u + i];
+            t += v.x + v.y + v.z + v.w;
         }
+        qsum[g][s] = t;
     }
     float acc[GROUP * 4];
     for (uint i = 0u; i < GROUP * 4u; i++) {
@@ -143,20 +126,41 @@ void main() {
     for (uint t0 = start; t0 < end; t0 += TILE) {
         uint tlen = min(uint(TILE), end - t0);
 
+        // Logits: lane e decodes key t0+e from its 9-uvec4 block.
         if (lane < tlen) {
-            uint e = lane;
+            uint b4 = (kv * p.capacity + t0 + lane) * 9u;
+            uvec4 h = kbuf.d[b4];
             float dots[GROUP];
             for (uint g = 0u; g < GROUP; g++) {
                 dots[g] = 0.0;
             }
-            for (uint d = 0u; d < HD; d++) {
-                float kval = dequantK(t0 + e, kv, d);
+            for (uint j = 0u; j < 4u; j++) {
+                float dl0, ml0, dl1, ml1;
+                scaleMin(h, j * 2u, dl0, ml0);
+                scaleMin(h, j * 2u + 1u, dl1, ml1);
+                uvec4 c0 = kbuf.d[b4 + 1u + j * 2u];
+                uvec4 c1 = kbuf.d[b4 + 2u + j * 2u];
+                float s0[GROUP];
+                float s1[GROUP];
                 for (uint g = 0u; g < GROUP; g++) {
-                    dots[g] += qs[g][d] * kval;
+                    s0[g] = 0.0;
+                    s1[g] = 0.0;
+                }
+                for (uint i = 0u; i < 8u; i++) {
+                    uint w = (i < 4u) ? c0[i] : c1[i - 4u];
+                    vec4 lo = vec4(float(w & 0xFu), float((w >> 8u) & 0xFu), float((w >> 16u) & 0xFu), float((w >> 24u) & 0xFu));
+                    vec4 hi = vec4(float((w >> 4u) & 0xFu), float((w >> 12u) & 0xFu), float((w >> 20u) & 0xFu), float(w >> 28u));
+                    for (uint g = 0u; g < GROUP; g++) {
+                        s0[g] += dot(lo, qs4[g][j * 16u + i]);
+                        s1[g] += dot(hi, qs4[g][j * 16u + 8u + i]);
+                    }
+                }
+                for (uint g = 0u; g < GROUP; g++) {
+                    dots[g] += dl0 * s0[g] - ml0 * qsum[g][j * 2u] + dl1 * s1[g] - ml1 * qsum[g][j * 2u + 1u];
                 }
             }
             for (uint g = 0u; g < GROUP; g++) {
-                logits[e][g] = dots[g] * p.scale;
+                logits[lane][g] = dots[g] * p.scale;
             }
         }
         barrier();
@@ -181,8 +185,6 @@ void main() {
         }
         barrier();
 
-        uint d0 = lane;
-        uint d1 = lane + LS;
         for (uint g = 0u; g < GROUP; g++) {
             float c = corr[g];
             acc[g * 4u] *= c;
@@ -190,17 +192,18 @@ void main() {
             acc[g * 4u + 2u] *= c;
             acc[g * 4u + 3u] *= c;
         }
+        // V: this lane owns dims 2*lane, 2*lane+1, 2*lane+128, 2*lane+129.
         for (uint e = 0u; e < tlen; e++) {
-            float v0 = dequantV(t0 + e, kv, d0 * 2u);
-            float v1 = dequantV(t0 + e, kv, d0 * 2u + 1u);
-            float v2 = dequantV(t0 + e, kv, d1 * 2u);
-            float v3 = dequantV(t0 + e, kv, d1 * 2u + 1u);
+            uint w0 = (kv * p.capacity + t0 + e) * 36u;
+            uvec4 h = uvec4(vbuf.d[w0], vbuf.d[w0 + 1u], vbuf.d[w0 + 2u], vbuf.d[w0 + 3u]);
+            vec2 va = dequantV2(w0, h, lane * 2u);
+            vec2 vb = dequantV2(w0, h, lane * 2u + 128u);
             for (uint g = 0u; g < GROUP; g++) {
                 float w = logits[e][g];
-                acc[g * 4u] += w * v0;
-                acc[g * 4u + 1u] += w * v1;
-                acc[g * 4u + 2u] += w * v2;
-                acc[g * 4u + 3u] += w * v3;
+                acc[g * 4u] += w * va.x;
+                acc[g * 4u + 1u] += w * va.y;
+                acc[g * 4u + 2u] += w * vb.x;
+                acc[g * 4u + 3u] += w * vb.y;
             }
         }
         barrier();
