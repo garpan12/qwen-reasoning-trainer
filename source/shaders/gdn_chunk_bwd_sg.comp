@@ -1,0 +1,191 @@
+#version 450
+
+// Chunked GatedDeltaNet, pass 4 (reverse row scan), subgroup-parallel variant of
+// gdn_chunk_bwd.comp. Same bindings, push constants and results (to rounding).
+// One 32-lane subgroup per (head, state row j), 4 rows per workgroup. Lane l owns
+// row elements i = l + 32*r (S_v <= 128) and chunk positions pp = l + 32*m
+// (C <= 64). Requires 32-lane subgroups: NVIDIA only.
+
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define MAXR 4
+#define MAXP 2
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly buffer Q { float qv[];    };
+layout(binding = 1) readonly buffer K { float kv[];    };
+layout(binding = 2) readonly buffer V { float vv[];    };
+layout(binding = 3) readonly buffer B { float betav[]; };
+layout(binding = 4) readonly buffer DO { float dov[];  };
+layout(binding = 5) readonly buffer DN { float dnv[];  };
+layout(binding = 6)          buffer W { float w[];     };
+layout(binding = 7)          buffer DV { float dvv[];  };
+layout(binding = 8)          buffer DS { float dsv[];  };
+layout(binding = 9)          buffer DBE { float dbev[]; };
+
+layout(push_constant) uniform P {
+    uint sv;
+    uint h;
+    uint nTok;
+    uint C;
+    uint NC;
+    float scale;
+} p;
+
+void main() {
+    uint rowId = gl_WorkGroupID.x * 4u + gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint hh = rowId / p.sv;
+    uint j = rowId - hh * p.sv;
+    if (hh >= p.h || p.sv > 32u * MAXR || p.C > 32u * MAXP) {
+        return;  // uniform across the subgroup
+    }
+
+    uint offA = p.h * p.NC * p.C * p.sv;
+    uint offB = offA + p.h * p.NC * p.C * p.C;
+    uint offDelta = offB + p.h * p.NC * p.C * p.C;
+    uint offBnd = offDelta + p.h * p.NC * p.C * p.sv;
+    uint offZsol = offBnd + p.h * (p.NC + 1u) * p.sv * p.sv;
+    uint offScEnd = offZsol + p.h * p.NC * p.C * p.sv;
+    uint offDA = offScEnd + p.h * p.NC * p.sv * p.sv;
+    uint offDBt = offDA + p.h * p.NC * p.C * p.C;
+
+    float dS[MAXR];
+    float dSc[MAXR];
+    float Sc[MAXR];
+    float gl[MAXR];
+    float dd[MAXP];
+    float zs[MAXP];
+    float dl[MAXP];
+
+    uint nb = hh * p.sv * p.sv + j * p.sv;
+    for (uint r = 0u; r < MAXR; r++) {
+        uint i = lane + 32u * r;
+        dS[r] = (i < p.sv) ? dnv[nb + i] : 0.0;
+    }
+
+    for (int ci = int(p.NC) - 1; ci >= 0; ci--) {
+        uint c = uint(ci);
+        uint t0 = c * p.C;
+        uint clen = min(p.C, p.nTok - t0);
+        uint gcBase = ((hh * p.NC + c) * p.C) * p.sv;
+        uint aBase = offA + (hh * p.NC + c) * p.C * p.C;
+        uint bBase = offB + (hh * p.NC + c) * p.C * p.C;
+        uint dBase = offDelta + ((hh * p.NC + c) * p.C) * p.sv;
+        uint zBase = offZsol + ((hh * p.NC + c) * p.C) * p.sv;
+        uint seBase = offScEnd + (hh * p.NC + c) * p.sv * p.sv;
+        uint daBase = offDA + (hh * p.NC + c) * p.C * p.C;
+        uint dbBase = offDBt + (hh * p.NC + c) * p.C * p.C;
+        uint last = clen - 1u;
+
+        for (uint r = 0u; r < MAXR; r++) {
+            uint i = lane + 32u * r;
+            if (i < p.sv) {
+                Sc[r] = w[offBnd + ((hh * (p.NC + 1u) + c) * p.sv + j) * p.sv + i];
+                w[seBase + j * p.sv + i] = dS[r];
+                gl[r] = w[gcBase + last * p.sv + i];
+            } else {
+                Sc[r] = 0.0;
+                gl[r] = 0.0;
+            }
+        }
+        for (uint m = 0u; m < MAXP; m++) {
+            uint pp = lane + 32u * m;
+            dl[m] = (pp < clen) ? w[dBase + pp * p.sv + j] : 0.0;
+            dd[m] = 0.0;
+            zs[m] = 0.0;
+        }
+        // (a) chunk-end state: ddelta from sum_p w_p (x) delta_p, dSc from e (*) S_c.
+        for (uint pp = 0u; pp < clen; pp++) {
+            uint kb = ((t0 + pp) * p.h + hh) * p.sv;
+            float part = 0.0;
+            for (uint r = 0u; r < MAXR; r++) {
+                uint i = lane + 32u * r;
+                if (i < p.sv) {
+                    part += dS[r] * exp(gl[r] - w[gcBase + pp * p.sv + i]) * kv[kb + i];
+                }
+            }
+            float acc = subgroupAdd(part);
+            for (uint m = 0u; m < MAXP; m++) {
+                if (lane + 32u * m == pp) {
+                    dd[m] = acc;
+                }
+            }
+        }
+        for (uint r = 0u; r < MAXR; r++) {
+            dSc[r] = exp(gl[r]) * dS[r];
+        }
+        // (b) outputs.
+        for (uint rt = 0u; rt < clen; rt++) {
+            uint ob = ((t0 + rt) * p.h + hh) * p.sv;
+            float dor = dov[ob + j];
+            for (uint r = 0u; r < MAXR; r++) {
+                uint i = lane + 32u * r;
+                if (i < p.sv) {
+                    dSc[r] += p.scale * dor * exp(w[gcBase + rt * p.sv + i]) * qv[ob + i];
+                }
+            }
+            for (uint m = 0u; m < MAXP; m++) {
+                uint pp = lane + 32u * m;
+                if (pp <= rt) {
+                    atomicAdd(w[dbBase + rt * p.C + pp], p.scale * dor * dl[m]);
+                    dd[m] += p.scale * w[bBase + rt * p.C + pp] * dor;
+                }
+            }
+        }
+        // (c) solve M^T z = ddelta; dM -> dA/dBeta. (d) rhs -> dV/dBeta/dSc/dktil.
+        for (int ri = int(clen) - 1; ri >= 0; ri--) {
+            uint r = uint(ri);
+            uint kb = ((t0 + r) * p.h + hh) * p.sv;
+            float br = betav[(t0 + r) * p.h + hh];
+            float part = 0.0;
+            for (uint m = 0u; m < MAXP; m++) {
+                uint pp = lane + 32u * m;
+                if (pp == r) {
+                    part += dd[m];
+                } else if (pp > r && pp < clen) {
+                    part -= betav[(t0 + pp) * p.h + hh] * w[aBase + r * p.C + pp] * zs[m];
+                }
+            }
+            float z = subgroupAdd(part);
+            float dmA = 0.0;
+            for (uint m = 0u; m < MAXP; m++) {
+                uint pp = lane + 32u * m;
+                if (pp == r) {
+                    zs[m] = z;
+                } else if (pp < r) {
+                    float dm = -z * dl[m];
+                    atomicAdd(w[daBase + pp * p.C + r], br * dm);
+                    dmA += dm * w[aBase + pp * p.C + r];
+                }
+            }
+            float sp = 0.0;
+            for (uint rr = 0u; rr < MAXR; rr++) {
+                uint i = lane + 32u * rr;
+                if (i < p.sv) {
+                    float ek = exp(w[gcBase + r * p.sv + i]) * kv[kb + i];
+                    sp += Sc[rr] * ek;
+                    dSc[rr] -= br * z * ek;
+                }
+            }
+            float red = subgroupAdd(dmA - z * sp);
+            if (lane == 0u) {
+                atomicAdd(dbev[(t0 + r) * p.h + hh], red + z * vv[kb + j]);
+                dvv[kb + j] += br * z;
+                w[zBase + r * p.sv + j] = z;
+            }
+        }
+        for (uint r = 0u; r < MAXR; r++) {
+            dS[r] = dSc[r];
+        }
+    }
+    for (uint r = 0u; r < MAXR; r++) {
+        uint i = lane + 32u * r;
+        if (i < p.sv) {
+            dsv[nb + i] = dS[r];
+        }
+    }
+}

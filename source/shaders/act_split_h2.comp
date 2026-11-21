@@ -1,0 +1,61 @@
+#version 450
+// Split an fp32 [M][R] activation into packed fp16 hi/lo parts for the pre-split
+// tensor-core GEMMs. Each 128-row tile gets one power-of-two scale s so its max
+// |x| maps to 2^14 (no fp16 overflow, ~21-bit mantissa from hi + lo); the GEMM
+// multiplies its fp32 result by tinv[tile] = 1/s. One workgroup per row.
+// Layout (uint = 2 halves): hi[(m*R + r)/2], then lo at M*R/2 + (m*R + r)/2.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer X { float x[]; };
+layout(binding = 1) readonly  buffer RM { float rm[]; };
+layout(binding = 2) writeonly buffer Y { uint y[]; };
+layout(binding = 3) writeonly buffer TI { float tinv[]; };
+
+layout(push_constant) uniform P {
+    uint R;   // even
+    uint M;
+} p;
+
+shared float red[32];
+shared float se;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint tile = row >> 7u;
+    uint base = tile << 7u;
+    float mx = (tid < 128u && base + tid < p.M) ? rm[base + tid] : 0.0;
+    mx = subgroupMax(mx);
+    if (subgroupElect()) {
+        red[gl_SubgroupID] = mx;
+    }
+    barrier();
+    if (tid == 0u) {
+        float t = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; s++) {
+            t = max(t, red[s]);
+        }
+        float e = t > 0.0 ? clamp(14.0 - ceil(log2(t)), -100.0, 100.0) : 0.0;
+        se = e;
+        if (row == base) {
+            tinv[tile] = exp2(-e);
+        }
+    }
+    barrier();
+    float s = exp2(se);
+    uint half_ = p.R >> 1u;
+    uint loOff = p.M * half_;
+    for (uint i2 = tid; i2 < half_; i2 += 256u) {
+        uint e0 = row * p.R + 2u * i2;
+        float x0 = x[e0] * s;
+        float x1 = x[e0 + 1u] * s;
+        float h0 = uintBitsToFloat(floatBitsToUint(x0) & 0xFFFFE000u);
+        float h1 = uintBitsToFloat(floatBitsToUint(x1) & 0xFFFFE000u);
+        y[row * half_ + i2] = packHalf2x16(vec2(h0, h1));
+        y[loOff + row * half_ + i2] = packHalf2x16(vec2(x0 - h0, x1 - h1));
+    }
+}

@@ -1,0 +1,50 @@
+#version 450
+
+// Skinny float32 GEMM, same contract as matmul.comp for N <= 16:
+//   C[n,m] = sum_k A[n,k] * B[m,k]   (A [N][K], B [M][K], C at c[m*N + n])
+// One 32-lane subgroup per output column m (8 per workgroup); lanes stride k
+// (coalesced B reads), each keeps NR partial sums, reduced with subgroupAdd.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define NR 16
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer A { float a[]; };
+layout(binding = 1) readonly  buffer B { float b[]; };
+layout(binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint M;
+    uint pad;
+} p;
+
+void main() {
+    uint m = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    if (m >= p.M) {
+        return;
+    }
+    float acc[NR];
+    for (uint r = 0u; r < NR; r++) {
+        acc[r] = 0.0;
+    }
+    for (uint k = lane; k < p.K; k += 32u) {
+        float xv = b[m * p.K + k];
+        for (uint r = 0u; r < NR; r++) {
+            if (r < p.N) {
+                acc[r] += a[r * p.K + k] * xv;
+            }
+        }
+    }
+    for (uint r = 0u; r < NR; r++) {
+        float s = subgroupAdd(acc[r]);
+        if (lane == r && r < p.N) {
+            c[m * p.N + r] = s;
+        }
+    }
+}

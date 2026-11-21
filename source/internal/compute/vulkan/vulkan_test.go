@@ -1,6 +1,7 @@
 package vulkan_test
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -1154,6 +1155,20 @@ func TestVulkanAttentionBackward(t *testing.T) {
 	compare(t, "attn_back dQ noncausal", vq2, cq2)
 	compare(t, "attn_back dK noncausal", vk2, ck2)
 	compare(t, "attn_back dV noncausal", vv2, cv2)
+
+	// headDim 256 (attn_back_dq_q16 on NVIDIA): partial 16-query/key tiles,
+	// non-square non-causal, and many key tiles.
+	for _, tc := range []struct {
+		nHead, nHeadKV, nQ, nKV int
+		causal                  bool
+	}{{6, 2, 37, 37, true}, {4, 2, 20, 37, false}, {4, 1, 300, 300, true}} {
+		cq3, ck3, cv3 := run(c, 256, tc.nHead, tc.nHeadKV, tc.nQ, tc.nKV, tc.causal)
+		vq3, vk3, vv3 := run(v, 256, tc.nHead, tc.nHeadKV, tc.nQ, tc.nKV, tc.causal)
+		name := fmt.Sprintf("attn_back hd256 %+v", tc)
+		compare(t, name+" dQ", vq3, cq3)
+		compare(t, name+" dK", vk3, ck3)
+		compare(t, name+" dV", vv3, cv3)
+	}
 
 	// Independent oracle: autograd.AttentionBackward on the same causal inputs
 	// (seeds match the first run above).

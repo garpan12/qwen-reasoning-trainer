@@ -1,0 +1,6 @@
+#version 450
+// Tensor-core GEMM over an fp32 weight that was dequantized once per call
+// (decode-once path); see matmul_wq_cm_body.glsl. Grid is m-fastest.
+#define SWAP_GRID
+#define QDECODE(n, kk) uintBitsToFloat(data[(n) * p.K + (kk)])
+#include "matmul_wq_cm_body.glsl"

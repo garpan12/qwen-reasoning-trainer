@@ -1,0 +1,3 @@
+#version 450
+// Pre-split tensor-core GEMM, transposed: o[m, k] = sum_n d[m, n] * W[n, k].
+#include "matmul_h2_body.glsl"

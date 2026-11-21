@@ -1,0 +1,209 @@
+#version 450
+
+// Attention backward pass 1, query-tiled variant of attn_back_dq_tile.comp for
+// headDim == 256: same bindings, push constants and outputs (dQ, the per-query
+// stats m/l/pd, and p/ds in pds laid out [key e][query qid]) to rounding.
+//
+// One 256-invocation workgroup per (head, block of 16 queries); invocation
+// (q = tid % 16, c = tid / 16) handles query q0+q and, in each 16-key tile,
+// key t0+c. Three sweeps over the keys reuse K/V tiles from shared memory:
+//   1) s = scale q.k (stored raw in pds), per-invocation online max/sum
+//   2) dp = dOut.v, p = exp(s - m) / l (pds), dp (ds slot), sum p*dp
+//   3) ds = p (dp - pd) scale (ds slot), dQ = sum_e ds_e k_e
+// Each pds cell is revisited by the invocation that wrote it, so the sweeps
+// need no extra synchronization. push.base is the workgroup offset.
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Q     { float q[];     };
+layout(binding = 1) readonly buffer K     { float k[];     };
+layout(binding = 2) readonly buffer V     { float v[];     };
+layout(binding = 3) readonly buffer DOut  { float dout[];  };
+layout(binding = 4)          buffer Stats { float stats[]; };
+layout(binding = 5)          buffer DQ    { float dq[];    };
+layout(binding = 6)          buffer PDS   { float pds[];   };
+
+layout(push_constant) uniform P {
+    uint  hd;
+    uint  nQ;
+    uint  nKV;
+    uint  nHead;
+    uint  nHeadKV;
+    uint  causal;
+    float scale;
+    uint  base;
+} p;
+
+#define QB 16u
+#define KT 16u
+#define HD 256u
+#define QS 257u   // padded row stride: 16 different rows are read per subgroup
+#define SS 17u
+
+shared float qd[QB * QS];    // q rows (sweep 1), then dOut rows (sweep 2)
+shared float kvs[KT * HD];   // K or V tile (rows read as broadcasts)
+shared float S[QB * SS];     // ds tile for the dQ product
+shared float redm[256];
+shared float redl[256];
+shared float rowm[QB];
+shared float rowl[QB];
+shared float rowpd[QB];
+
+void main() {
+    uint nQB = (p.nQ + QB - 1u) / QB;
+    uint wg = p.base + gl_WorkGroupID.x;
+    uint h = wg / nQB;
+    uint qb = wg - h * nQB;
+    if (h >= p.nHead) {
+        return;
+    }
+    uint kvh = h / (p.nHead / p.nHeadKV);
+    uint tid = gl_LocalInvocationID.x;
+    uint qi = tid & 15u;
+    uint c = tid >> 4u;
+    uint q0 = qb * QB;
+    uint i = q0 + qi;
+    uint n = p.nHead * p.nQ;
+    uint qid = h * p.nQ + i;
+    uint strideQ = n;
+    uint dsBase = p.nKV * strideQ;
+    bool causalSq = p.causal == 1u && p.nQ == p.nKV;
+    uint maxJ = causalSq ? min(q0 + QB, p.nKV) : p.nKV;
+
+    for (uint idx = tid; idx < QB * HD; idx += 256u) {
+        uint r = idx / HD;
+        uint d = idx - r * HD;
+        uint ii = q0 + r;
+        qd[r * QS + d] = (ii < p.nQ) ? q[(ii * p.nHead + h) * HD + d] : 0.0;
+    }
+
+    // Sweep 1: logits, online max / sum per invocation.
+    float mt = -1e30;
+    float lt = 0.0;
+    for (uint t0 = 0u; t0 < maxJ; t0 += KT) {
+        barrier();
+        for (uint idx = tid; idx < KT * HD; idx += 256u) {
+            uint e = idx / HD;
+            uint d = idx - e * HD;
+            uint j = t0 + e;
+            kvs[e * HD + d] = (j < p.nKV) ? k[(j * p.nHeadKV + kvh) * HD + d] : 0.0;
+        }
+        barrier();
+        uint j = t0 + c;
+        bool valid = i < p.nQ && j < p.nKV && (!causalSq || j <= i);
+        if (valid) {
+            float dot = 0.0;
+            for (uint d = 0u; d < HD; d++) {
+                dot += qd[qi * QS + d] * kvs[c * HD + d];
+            }
+            float s = dot * p.scale;
+            pds[j * strideQ + qid] = s;
+            float mn = max(mt, s);
+            lt = lt * exp(mt - mn) + exp(s - mn);
+            mt = mn;
+        }
+    }
+    redm[c * QB + qi] = mt;
+    redl[c * QB + qi] = lt;
+    barrier();
+    if (c == 0u) {
+        float M = -1e30;
+        for (uint cc = 0u; cc < 16u; cc++) {
+            M = max(M, redm[cc * QB + qi]);
+        }
+        float L = 0.0;
+        for (uint cc = 0u; cc < 16u; cc++) {
+            L += redl[cc * QB + qi] * exp(redm[cc * QB + qi] - M);
+        }
+        rowm[qi] = M;
+        rowl[qi] = L;
+    }
+    barrier();
+    float m = rowm[qi];
+    float invl = 1.0 / rowl[qi];
+
+    for (uint idx = tid; idx < QB * HD; idx += 256u) {
+        uint r = idx / HD;
+        uint d = idx - r * HD;
+        uint ii = q0 + r;
+        qd[r * QS + d] = (ii < p.nQ) ? dout[(ii * p.nHead + h) * HD + d] : 0.0;
+    }
+
+    // Sweep 2: dp = dOut.v, normalized p, sum p*dp.
+    float pdt = 0.0;
+    for (uint t0 = 0u; t0 < maxJ; t0 += KT) {
+        barrier();
+        for (uint idx = tid; idx < KT * HD; idx += 256u) {
+            uint e = idx / HD;
+            uint d = idx - e * HD;
+            uint j = t0 + e;
+            kvs[e * HD + d] = (j < p.nKV) ? v[(j * p.nHeadKV + kvh) * HD + d] : 0.0;
+        }
+        barrier();
+        uint j = t0 + c;
+        bool valid = i < p.nQ && j < p.nKV && (!causalSq || j <= i);
+        if (valid) {
+            float dp = 0.0;
+            for (uint d = 0u; d < HD; d++) {
+                dp += qd[qi * QS + d] * kvs[c * HD + d];
+            }
+            float pe = exp(pds[j * strideQ + qid] - m) * invl;
+            pds[j * strideQ + qid] = pe;
+            pds[dsBase + j * strideQ + qid] = dp;
+            pdt += pe * dp;
+        }
+    }
+    redm[c * QB + qi] = pdt;
+    barrier();
+    if (c == 0u) {
+        float pd = 0.0;
+        for (uint cc = 0u; cc < 16u; cc++) {
+            pd += redm[cc * QB + qi];
+        }
+        rowpd[qi] = pd;
+        if (i < p.nQ) {
+            stats[qid] = m;
+            stats[n + qid] = rowl[qi];
+            stats[2u * n + qid] = pd;
+        }
+    }
+    barrier();
+    float pd = rowpd[qi];
+
+    // Sweep 3: ds and dQ = sum_e ds_e k_e (invocation owns dims c + 16*j2).
+    float acc[16];
+    for (uint j2 = 0u; j2 < 16u; j2++) {
+        acc[j2] = 0.0;
+    }
+    for (uint t0 = 0u; t0 < maxJ; t0 += KT) {
+        barrier();
+        for (uint idx = tid; idx < KT * HD; idx += 256u) {
+            uint e = idx / HD;
+            uint d = idx - e * HD;
+            uint j = t0 + e;
+            kvs[e * HD + d] = (j < p.nKV) ? k[(j * p.nHeadKV + kvh) * HD + d] : 0.0;
+        }
+        uint j = t0 + c;
+        bool valid = i < p.nQ && j < p.nKV && (!causalSq || j <= i);
+        float ds = 0.0;
+        if (valid) {
+            float pe = pds[j * strideQ + qid];
+            float dp = pds[dsBase + j * strideQ + qid];
+            ds = pe * (dp - pd) * p.scale;
+            pds[dsBase + j * strideQ + qid] = ds;
+        }
+        S[qi * SS + c] = ds;
+        barrier();
+        for (uint e = 0u; e < KT; e++) {
+            float dsv = S[qi * SS + e];
+            for (uint j2 = 0u; j2 < 16u; j2++) {
+                acc[j2] += dsv * kvs[e * HD + c + 16u * j2];
+            }
+        }
+    }
+    if (i < p.nQ) {
+        for (uint j2 = 0u; j2 < 16u; j2++) {
+            dq[(i * p.nHead + h) * HD + c + 16u * j2] = acc[j2];
+        }
+    }
+}

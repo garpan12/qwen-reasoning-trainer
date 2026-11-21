@@ -400,6 +400,14 @@ func (b *Backend) MatMul(a, c compute.Buffer) (compute.Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Skinny outputs (e.g. the rank-16 LoRA down-projection): one subgroup per column.
+	if b.skinnyGEMM() && n <= 16 && k >= 256 && ceilDiv(uint32(m), 8) <= maxWorkGroups {
+		if err := b.dispatch("matmul_skinny", []*buffer{x, y, out}, push(uint32(k), uint32(n), uint32(m), uint32(0)), [3]uint32{ceilDiv(uint32(m), 8), 1, 1}); err != nil {
+			b.Free(out)
+			return nil, err
+		}
+		return out, nil
+	}
 	// Tiled GEMM: one 64x64 workgroup tile per output block.
 	gx := ceilDiv(uint32(n), 64)
 	gy := ceilDiv(uint32(m), 64)
@@ -1465,9 +1473,13 @@ func (b *Backend) Attention(q, k, v compute.Buffer, nHead, nHeadKV int, scale fl
 		shader = "attention_naive"
 	}
 	// Chunk the dispatch to stay below the per-dimension group limit: one
-	// workgroup per query.
+	// workgroup per query (attention_tile: per block of 16 queries).
 	const maxPerDispatch = 65535
 	total := uint32(nHead * nTok)
+	if headDim == 256 && b.attnTile() && nHeadKV > 0 && nHead%nHeadKV == 0 {
+		shader = "attention_tile"
+		total = uint32(nHead) * ceilDiv(uint32(nTok), 16)
+	}
 	for start := uint32(0); start < total; start += maxPerDispatch {
 		chunk := total - start
 		if chunk > maxPerDispatch {
@@ -1955,13 +1967,19 @@ func (b *Backend) AttentionBackward(q, k, v, dOut compute.Buffer, nHead, nHeadKV
 		defer b.Free(pds)
 		const maxPerDispatch = 65535
 		total := uint32(nHead * nQ)
+		dqShader := "attn_back_dq_tile"
+		if hd == 256 && b.attnTile() && nHeadKV > 0 && nHead%nHeadKV == 0 {
+			// 16 queries per workgroup sharing K/V tiles.
+			dqShader = "attn_back_dq_q16"
+			total = uint32(nHead) * ceilDiv(uint32(nQ), 16)
+		}
 		for start := uint32(0); start < total; start += maxPerDispatch {
 			chunk := total - start
 			if chunk > maxPerDispatch {
 				chunk = maxPerDispatch
 			}
 			pc := push(uint32(hd), uint32(nQ), uint32(nKV), uint32(nHead), uint32(nHeadKV), c, scale, start)
-			if err := b.dispatch("attn_back_dq_tile", []*buffer{qb, kb, vb, db, stats, dQ, pds}, pc, [3]uint32{chunk, 1, 1}); err != nil {
+			if err := b.dispatch(dqShader, []*buffer{qb, kb, vb, db, stats, dQ, pds}, pc, [3]uint32{chunk, 1, 1}); err != nil {
 				freeOut()
 				return nil, nil, nil, err
 			}
@@ -2138,8 +2156,8 @@ func (b *Backend) GatedDeltaNet(q, k, v, g, beta, state compute.Buffer) (compute
 		return nil, nil, err
 	}
 	scale := float32(1 / math.Sqrt(float64(sv)))
-	groups := [3]uint32{ceilDiv(uint32(h*sv), 128), 1, 1}
-	if err := b.dispatch("gated_delta_net", []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
+	gdnName, groups := b.gdnForwardDispatch(h, sv)
+	if err := b.dispatch(gdnName, []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
 		push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda, uint32(h)), groups); err != nil {
 		b.Free(out)
 		b.Free(ns)
@@ -2200,8 +2218,8 @@ func (b *Backend) GatedDeltaNetQK(q, k, v, g, beta, state compute.Buffer, nK int
 		return nil, nil, err
 	}
 	scale := float32(1 / math.Sqrt(float64(sv)))
-	groups := [3]uint32{ceilDiv(uint32(h*sv), 128), 1, 1}
-	if err := b.dispatch("gated_delta_net", []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
+	gdnName, groups := b.gdnForwardDispatch(h, sv)
+	if err := b.dispatch(gdnName, []*buffer{tq, tk, tv, tg, tb, ts, out, ns},
 		push(uint32(sv), uint32(h), uint32(nTok), uint32(gstride), scale, kda, uint32(nK)), groups); err != nil {
 		b.Free(out)
 		b.Free(ns)
@@ -2449,13 +2467,17 @@ func (b *Backend) GatedDeltaNetChunkedForwardAux(q, k, v, g, beta, state compute
 		b.Free(work)
 		return nil, zero, err
 	}
-	if err := b.dispatch("gdn_chunk_ab", []*buffer{tk, tq, work},
+	if err := b.dispatch(b.gdnChunkName("gdn_chunk_ab", sv, L.C), []*buffer{tk, tq, work},
 		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), g3(hhNC)); err != nil {
 		b.Free(work)
 		return nil, zero, err
 	}
-	if err := b.dispatch("gdn_chunk_fwd", []*buffer{tk, tv, tb, ts, work},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), g3(ceilDiv(hhSV, 128))); err != nil {
+	fwdName, fwdGroups := "gdn_chunk_fwd", g3(ceilDiv(hhSV, 128))
+	if n := b.gdnChunkName("gdn_chunk_fwd", sv, L.C); n != "gdn_chunk_fwd" {
+		fwdName, fwdGroups = n, g3(ceilDiv(hhSV, 4))
+	}
+	if err := b.dispatch(fwdName, []*buffer{tk, tv, tb, ts, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(L.C), uint32(L.NC)), fwdGroups); err != nil {
 		b.Free(work)
 		return nil, zero, err
 	}
@@ -2577,18 +2599,26 @@ func (b *Backend) GatedDeltaNetChunkedBackward(q, k, v, g, beta, state, dOut, dN
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	if err := b.dispatch("gdn_chunk_ab", []*buffer{tk, tq, work},
+	if err := b.dispatch(b.gdnChunkName("gdn_chunk_ab", sv, C), []*buffer{tk, tq, work},
 		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), g3(hhNC)); err != nil {
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	if err := b.dispatch("gdn_chunk_fwd", []*buffer{tk, tv, tb, ts, work},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), g3(ceilDiv(hhSV, 128))); err != nil {
+	fwdName, fwdGroups := "gdn_chunk_fwd", g3(ceilDiv(hhSV, 128))
+	if n := b.gdnChunkName("gdn_chunk_fwd", sv, C); n != "gdn_chunk_fwd" {
+		fwdName, fwdGroups = n, g3(ceilDiv(hhSV, 4))
+	}
+	if err := b.dispatch(fwdName, []*buffer{tk, tv, tb, ts, work},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC)), fwdGroups); err != nil {
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	if err := b.dispatch("gdn_chunk_bwd", []*buffer{tq, tk, tv, tb, td, tn, work, dV, dState, dBeta},
-		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC), scale), g3(ceilDiv(hhSV, 128))); err != nil {
+	bwdName, bwdGroups := "gdn_chunk_bwd", g3(ceilDiv(hhSV, 128))
+	if b.gdnSubgroup() && sv <= 128 && C <= 64 {
+		bwdName, bwdGroups = "gdn_chunk_bwd_sg", g3(ceilDiv(hhSV, 4))
+	}
+	if err := b.dispatch(bwdName, []*buffer{tq, tk, tv, tb, td, tn, work, dV, dState, dBeta},
+		push(uint32(sv), uint32(h), uint32(nTok), uint32(C), uint32(NC), scale), bwdGroups); err != nil {
 		freeAll()
 		return nil, nil, nil, nil, nil, nil, err
 	}
@@ -2826,6 +2856,167 @@ func m128Name(name string) string {
 	return "matmul_wq_m128_" + strings.TrimPrefix(name, "matmul_wq_")
 }
 
+// decodeOnce makes the tensor-core GEMMs dequantize each weight once per call
+// into fp32 scratch and multiply from that, instead of re-decoding every
+// quantized element once per 64-token output tile (16x at T=1024).
+// QWEN38_DECODE_ONCE=0 keeps the fused per-tile decode.
+var decodeOnce = os.Getenv("QWEN38_DECODE_ONCE") != "0"
+
+// decodeOnceMaxFloats caps the scratch (1 GiB of fp32); larger weights such
+// as the LM head keep the fused path.
+const decodeOnceMaxFloats = 256 << 20
+
+// gemmH2 selects the pre-split fp16 hi/lo tensor-core GEMMs (matmul_h2_cm,
+// matmul_t_h2_cm) for decode-once calls whose shapes fit their 128x128 tiles.
+// QWEN38_GEMM_H2=0 keeps the matmul_*_cm_f32 path.
+var gemmH2 = os.Getenv("QWEN38_GEMM_H2") != "0"
+
+func h2Fits(m, r, j int) bool {
+	return gemmH2 && m%128 == 0 && j%128 == 0 && r%32 == 0 &&
+		m/128 <= maxWorkGroups && j/128 <= maxWorkGroups
+}
+
+// matmulH2 computes out[mm*j + jj] = sum_r A[mm, r] * B[r, jj] on tensor cores,
+// where A is the fp32 [m][r] matrix xb and B comes from the quantized weight wb
+// of type typ: bt (forward) means wb is [j][r] and used transposed, otherwise
+// (backward dX) wb is [r][j]. Both operands are split into fp16 hi/lo once.
+func (b *Backend) matmulH2(wb *buffer, typ string, xb, out *buffer, m, r, j int, bt bool) error {
+	rows, rowLen := j, r
+	if !bt {
+		rows, rowLen = r, j
+	}
+	total := rows * rowLen
+	var scratch []*buffer
+	defer func() {
+		for _, s := range scratch {
+			b.Free(s)
+		}
+	}()
+	alloc := func(n int) (*buffer, error) {
+		s, err := b.newF32Buffer(n)
+		if err == nil {
+			scratch = append(scratch, s)
+		}
+		return s, err
+	}
+	ws, err := alloc(total) // packed hi/lo halves: 4 bytes per element
+	if err != nil {
+		return err
+	}
+	groups := ceilDiv(uint32(total/2), 256)
+	if groups > maxWorkGroups {
+		groups = maxWorkGroups
+	}
+	if err := b.dispatch("dequant_e_h2_"+typ, []*buffer{wb, ws},
+		push(uint32(rowLen), uint32(rows), uint32(total), uint32(0)), [3]uint32{groups, 1, 1}); err != nil {
+		return err
+	}
+	as, err := alloc(m * r)
+	if err != nil {
+		return err
+	}
+	rm, err := alloc(m)
+	if err != nil {
+		return err
+	}
+	ti, err := alloc(m / 128)
+	if err != nil {
+		return err
+	}
+	if err := b.dispatch("act_rowmax", []*buffer{xb, rm}, push(uint32(r), uint32(m)), [3]uint32{uint32(m), 1, 1}); err != nil {
+		return err
+	}
+	if err := b.dispatch("act_split_h2", []*buffer{xb, rm, as, ti}, push(uint32(r), uint32(m)), [3]uint32{uint32(m), 1, 1}); err != nil {
+		return err
+	}
+	name := "matmul_t_h2_cm"
+	if bt {
+		name = "matmul_h2_cm"
+	}
+	// Opt-in: QWEN38_GEMM_TERMS=2 drops the weight lo term (~6% faster step,
+	// losses within ~1e-3). The 1-term variant diverged (NaN) and was removed.
+	if os.Getenv("QWEN38_GEMM_TERMS") == "2" {
+		name += "_t2"
+	}
+	return b.dispatch(name, []*buffer{as, ws, ti, out}, push(uint32(m), uint32(j), uint32(r), uint32(0)),
+		[3]uint32{uint32(m / 128), uint32(j / 128), 1})
+}
+
+// dequantElem dequantizes a whole weight to an fp32 [N][K] buffer with the
+// coalesced per-element dequant_e_<typ> kernel (same decoders as the fused
+// GEMMs). typ is the shader suffix, e.g. "q4_k".
+func (b *Backend) dequantElem(wb *buffer, typ string, k, n int) (*buffer, error) {
+	out, err := b.newF32Buffer(k, n)
+	if err != nil {
+		return nil, err
+	}
+	total := uint32(n * k)
+	groups := ceilDiv(total, 256)
+	if groups > maxWorkGroups {
+		groups = maxWorkGroups
+	}
+	if err := b.dispatch("dequant_e_"+typ, []*buffer{wb, out}, push(uint32(k), uint32(n), total, uint32(0)), [3]uint32{groups, 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// attnTile reports whether the square attention forward and backward use the
+// query-tiled attention_tile / attn_back_dq_q16 kernels (headDim 256, 16
+// queries per workgroup sharing K/V tiles). NVIDIA only; QWEN38_ATTN_TILE=0 keeps the one-query kernel.
+func (b *Backend) attnTile() bool {
+	return b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_ATTN_TILE") != "0"
+}
+
+// skinnyGEMM reports whether float32 GEMMs with a <= 16-wide output (the rank-16
+// LoRA products) use matmul_skinny / matmul_t_skinny (one 32-lane subgroup per
+// output column). NVIDIA only; QWEN38_SKINNY=0 keeps the tiled kernels.
+func (b *Backend) skinnyGEMM() bool {
+	return b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_SKINNY") != "0"
+}
+
+// gdnSubgroup reports whether the GatedDeltaNet forward uses the
+// subgroup-parallel gated_delta_net_sg kernel (one 32-lane subgroup per state
+// row instead of one lane). NVIDIA only; QWEN38_GDN_SG=0 keeps the old kernel.
+func (b *Backend) gdnSubgroup() bool {
+	return b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_GDN_SG") != "0"
+}
+
+// gdnChunkName returns the subgroup (_sg) variant of a chunked GatedDeltaNet
+// pass when gdnSubgroup is on and the shapes fit it (S_v <= 128, C <= 64).
+func (b *Backend) gdnChunkName(name string, sv, c int) string {
+	if b.gdnSubgroup() && sv <= 128 && c <= 64 {
+		return name + "_sg"
+	}
+	return name
+}
+
+// gdnForwardDispatch picks the GatedDeltaNet forward kernel and its grid for
+// h heads of s_v state rows.
+func (b *Backend) gdnForwardDispatch(h, sv int) (string, [3]uint32) {
+	if b.gdnSubgroup() {
+		return "gated_delta_net_sg", [3]uint32{ceilDiv(uint32(h*sv), 4), 1, 1}
+	}
+	return "gated_delta_net", [3]uint32{ceilDiv(uint32(h*sv), 128), 1, 1}
+}
+
+// coopMatGEMM reports whether the tensor-core *_cm_* fused GEMMs are used. They
+// need cooperative matrices and assume 32-lane subgroups (8 per 256-invocation
+// workgroup), so they are limited to NVIDIA. QWEN38_COOPMAT=0 disables them.
+func (b *Backend) coopMatGEMM() bool {
+	return b.coopMat && b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_COOPMAT") != "0"
+}
+
+// coopMatName maps a fused GEMM shader name (matmul_wq_* / matmul_t_wq_*) to its
+// tensor-core variant.
+func coopMatName(name string) string {
+	if strings.HasPrefix(name, "matmul_t_wq_") {
+		return "matmul_t_wq_cm_" + strings.TrimPrefix(name, "matmul_t_wq_")
+	}
+	return "matmul_wq_cm_" + strings.TrimPrefix(name, "matmul_wq_")
+}
+
 // gemv computes y = W * x for a single activation column using a fused
 // dequantize+GEMV shader. It returns errNoGemv when the type has no shader.
 func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
@@ -3013,9 +3204,41 @@ func (b *Backend) MatMulWeight(w, x compute.Buffer) (compute.Buffer, error) {
 	// Multi-token: a fused dequantize+GEMM decodes the weight in registers, so
 	// no float32 scratch is materialized (no maxStorageBufferRange pressure).
 	if name, ok := matmulWShaders[wb.typ]; ok && !b.noFusedFwd {
+		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats && h2Fits(m, k, n) {
+			out, err := b.newF32Buffer(n, m)
+			if err != nil {
+				return nil, err
+			}
+			if err := b.matmulH2(wb, strings.TrimPrefix(name, "matmul_wq_"), xb, out, m, k, n, true); err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
+		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats {
+			scratch, err := b.dequantElem(wb, strings.TrimPrefix(name, "matmul_wq_"), k, n)
+			if err != nil {
+				return nil, err
+			}
+			out, err := b.newF32Buffer(n, m)
+			if err != nil {
+				b.Free(scratch)
+				return nil, err
+			}
+			err = b.dispatch("matmul_wq_cm_f32", []*buffer{scratch, xb, out}, push(uint32(k), uint32(n), uint32(m), uint32(0)), [3]uint32{ceilDiv(uint32(m), 64), ceilDiv(uint32(n), 64), 1})
+			b.Free(scratch)
+			if err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
+		if b.coopMatGEMM() {
+			name = coopMatName(name)
+		}
 		gx := ceilDiv(uint32(n), 64)
 		gy := ceilDiv(uint32(m), 64)
-		if gemmM128 && m >= 128 {
+		if gemmM128 && m >= 128 && !b.coopMatGEMM() {
 			name = m128Name(name)
 			gy = ceilDiv(uint32(m), 128)
 		}
@@ -3127,9 +3350,33 @@ func (b *Backend) MatMulWeightTranspose(w, dY compute.Buffer) (compute.Buffer, e
 	}
 
 	if name, ok := matmulTWShaders[wb.typ]; ok && !b.noFusedT {
+		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats && h2Fits(m, n, k) {
+			if err := b.matmulH2(wb, strings.TrimPrefix(name, "matmul_t_wq_"), db, out, m, n, k, false); err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
+		if b.coopMatGEMM() && decodeOnce && m >= 128 && n*k <= decodeOnceMaxFloats {
+			scratch, err := b.dequantElem(wb, strings.TrimPrefix(name, "matmul_t_wq_"), k, n)
+			if err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			err = b.dispatch("matmul_t_wq_cm_f32", []*buffer{scratch, db, out}, push(uint32(k), uint32(n), uint32(m), uint32(0), uint32(n), uint32(0)), [3]uint32{ceilDiv(uint32(m), 64), ceilDiv(uint32(k), 64), 1})
+			b.Free(scratch)
+			if err != nil {
+				b.Free(out)
+				return nil, err
+			}
+			return out, nil
+		}
+		if b.coopMatGEMM() {
+			name = coopMatName(name)
+		}
 		gx := ceilDiv(uint32(k), 64)
 		gy := ceilDiv(uint32(m), 64)
-		if gemmM128 && m >= 128 {
+		if gemmM128 && m >= 128 && !b.coopMatGEMM() {
 			name = m128Name(name)
 			gy = ceilDiv(uint32(m), 128)
 		}
@@ -3196,6 +3443,9 @@ func (b *Backend) matmulT(w, d, out *buffer, K, N, M, n0, rows uint32, acc bool)
 	a := uint32(0)
 	if acc {
 		a = 1
+	}
+	if b.skinnyGEMM() && K <= 16 && rows >= 256 && ceilDiv(M, 8) <= maxWorkGroups {
+		return b.dispatch("matmul_t_skinny", []*buffer{w, d, out}, push(K, N, M, n0, rows, a), [3]uint32{ceilDiv(M, 8), 1, 1})
 	}
 	groups := [3]uint32{gx, gy, 1}
 	return b.dispatch("matmul_t", []*buffer{w, d, out}, push(K, N, M, n0, rows, a), groups)

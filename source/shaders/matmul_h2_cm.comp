@@ -1,0 +1,4 @@
+#version 450
+// Pre-split tensor-core GEMM, forward: out[m, n] = sum_k x[m, k] * W[n, k].
+#define BT
+#include "matmul_h2_body.glsl"
