@@ -400,6 +400,14 @@ func (b *Backend) MatMul(a, c compute.Buffer) (compute.Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Skinny outputs (e.g. the rank-16 LoRA down-projection): one subgroup per column.
+	if b.skinnyGEMM() && n <= 16 && k >= 256 && ceilDiv(uint32(m), 8) <= maxWorkGroups {
+		if err := b.dispatch("matmul_skinny", []*buffer{x, y, out}, push(uint32(k), uint32(n), uint32(m), uint32(0)), [3]uint32{ceilDiv(uint32(m), 8), 1, 1}); err != nil {
+			b.Free(out)
+			return nil, err
+		}
+		return out, nil
+	}
 	// Tiled GEMM: one 64x64 workgroup tile per output block.
 	gx := ceilDiv(uint32(n), 64)
 	gy := ceilDiv(uint32(m), 64)
@@ -2939,6 +2947,13 @@ func (b *Backend) dequantElem(wb *buffer, typ string, k, n int) (*buffer, error)
 	return out, nil
 }
 
+// skinnyGEMM reports whether float32 GEMMs with a <= 16-wide output (the rank-16
+// LoRA products) use matmul_skinny / matmul_t_skinny (one 32-lane subgroup per
+// output column). NVIDIA only; QWEN38_SKINNY=0 keeps the tiled kernels.
+func (b *Backend) skinnyGEMM() bool {
+	return b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_SKINNY") != "0"
+}
+
 // gdnSubgroup reports whether the GatedDeltaNet forward uses the
 // subgroup-parallel gated_delta_net_sg kernel (one 32-lane subgroup per state
 // row instead of one lane). NVIDIA only; QWEN38_GDN_SG=0 keeps the old kernel.
@@ -3406,6 +3421,9 @@ func (b *Backend) matmulT(w, d, out *buffer, K, N, M, n0, rows uint32, acc bool)
 	a := uint32(0)
 	if acc {
 		a = 1
+	}
+	if b.skinnyGEMM() && K <= 16 && rows >= 256 && ceilDiv(M, 8) <= maxWorkGroups {
+		return b.dispatch("matmul_t_skinny", []*buffer{w, d, out}, push(K, N, M, n0, rows, a), [3]uint32{ceilDiv(M, 8), 1, 1})
 	}
 	groups := [3]uint32{gx, gy, 1}
 	return b.dispatch("matmul_t", []*buffer{w, d, out}, push(K, N, M, n0, rows, a), groups)
