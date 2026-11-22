@@ -2805,6 +2805,10 @@ func (b *Backend) rowGEMVShader(typ quant.Type) (string, bool) {
 	if typ == quant.TypeIQ4_NL {
 		return "gemv_row_iq4_nl", b.gemvSubgroup()
 	}
+	// IQ3_S: subgroup row kernel over the per-element decoder.
+	if typ == quant.TypeIQ3_S && b.gemvSubgroup() {
+		return "gemv_row_iq3_s", true
+	}
 	name, ok := gemvRowShaders[typ]
 	if ok && typ == quant.TypeQ5_K {
 		switch os.Getenv("QWEN38_Q5K_ROW") {
