@@ -2880,6 +2880,18 @@ func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
 		if b.gemvSubgroup() {
 			name += "_sg"
 			rowsPerGroup = 4
+			// Several rows per subgroup reuse each activation load (measured
+			// best: 4 for IQ4_XS, 2 for Q5_K). QWEN38_GEMV_NR=1 disables.
+			if os.Getenv("QWEN38_GEMV_NR") != "1" {
+				switch w.typ {
+				case quant.TypeIQ4_XS:
+					name += "4"
+					rowsPerGroup = 16
+				case quant.TypeQ5_K:
+					name += "2"
+					rowsPerGroup = 8
+				}
+			}
 		}
 		for base := uint32(0); base < uint32(n); base += maxWorkGroups * rowsPerGroup {
 			rows := uint32(n) - base
