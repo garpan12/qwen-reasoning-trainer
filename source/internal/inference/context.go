@@ -3,6 +3,7 @@ package inference
 import (
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 
@@ -107,6 +108,9 @@ func kvHeadBytes(elements int, typ quant.Type) uint64 {
 // command-buffer size bounded without making short-context prefill needlessly
 // slow. It is not exposed as a CLI flag.
 func AutoPrefillChunk(context int, caps compute.Capabilities) int {
+	if n, err := strconv.Atoi(os.Getenv("QWEN38_PREFILL_CHUNK")); err == nil && n >= 64 {
+		return n
+	}
 	if context <= 0 {
 		context = 32768
 	}
