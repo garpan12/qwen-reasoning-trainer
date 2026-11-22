@@ -484,7 +484,11 @@ func (b *Backend) RMSNormAdd(a, add, w compute.Buffer, eps float32) (compute.Buf
 		}
 		hasW = 1
 	}
-	if err := b.dispatch("rms_norm_add", []*buffer{x, r, wb, sum, out},
+	normShader := "rms_norm_add"
+	if rows <= 4 && rowLen >= 1024 && b.gemvSubgroup() {
+		normShader = "rms_norm_add_wide" // decode: one wide workgroup per row
+	}
+	if err := b.dispatch(normShader, []*buffer{x, r, wb, sum, out},
 		push(uint32(rowLen), uint32(rows), eps, hasW), [3]uint32{uint32(rows), 1, 1}); err != nil {
 		b.Free(sum)
 		b.Free(out)
