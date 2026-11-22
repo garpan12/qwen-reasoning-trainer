@@ -1,0 +1,4 @@
+#version 450
+// Per-element q5_k dequant (decode-once GEMMs); see dequant_e_body.glsl.
+#define QDECODE(n, kk) deq_q5_k(n, kk)
+#include "dequant_e_body.glsl"

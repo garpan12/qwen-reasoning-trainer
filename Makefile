@@ -38,6 +38,10 @@ SHADER_INC := $(wildcard $(SHADER_DIR)/*.glsl)
 
 GLSL_FLAGS  := --target-env=vulkan1.1 -O -I $(SHADER_DIR)
 SPIRV_FLAGS := --target-env vulkan1.1
+# Tensor-core (cooperative matrix) GEMMs: built without -O, because shaderc 2023.8's
+# optimizer segfaults on cooperative-matrix SPIR-V. The driver optimizes them anyway.
+CM_SPV := $(filter $(SPIRV_DIR)/matmul_wq_cm_% $(SPIRV_DIR)/matmul_t_wq_cm_%,$(SHADER_SPV))
+$(CM_SPV): GLSL_FLAGS := --target-env=vulkan1.1 -I $(SHADER_DIR)
 
 # Local Python environment for the opt-in external references. Each check keeps
 # its own requirements.txt under source/e2e-tests/<name>/; both are installed

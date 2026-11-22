@@ -1,0 +1,125 @@
+#version 450
+
+// Attention forward, query-tiled variant of attention.comp (same bindings, push
+// constants and result to rounding) for headDim == 256. One 256-invocation
+// workgroup per (head, block of QB=16 queries): K and V tiles of KT=16 keys are
+// staged in shared memory once and reused by the 16 queries. Invocation
+// (q = tid/16, col = tid%16) computes logit (q, key col) and owns output
+// dimensions col + 16*j; the online softmax uses 16-lane clustered reductions,
+// so it requires subgroups of at least 16 lanes (NVIDIA: 32).
+// push.base is the workgroup offset for chunked dispatches.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer Q { float q[]; };
+layout(binding = 1) readonly  buffer K { float k[]; };
+layout(binding = 2) readonly  buffer V { float v[]; };
+layout(binding = 3) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint  headDim;
+    uint  nTok;
+    uint  nHead;
+    uint  nHeadKV;
+    float scale;
+    uint  causal;
+    uint  base;
+} p;
+
+#define QB 16u
+#define KT 16u
+#define HD 256u
+#define HS 257u   // padded shared row stride (bank-conflict free column reads)
+
+shared float qs[QB * HS];
+shared float kvs[KT * HS];
+shared float S[QB * KT];
+shared float sm[QB];
+shared float sl[QB];
+
+void main() {
+    uint nQB = (p.nTok + QB - 1u) / QB;
+    uint wg = p.base + gl_WorkGroupID.x;
+    uint h = wg / nQB;
+    uint qb = wg - h * nQB;
+    if (h >= p.nHead) {
+        return;
+    }
+    uint kvh = h / (p.nHead / p.nHeadKV);
+    uint tid = gl_LocalInvocationID.x;
+    uint q0 = qb * QB;
+    uint myq = tid >> 4u;
+    uint col = tid & 15u;
+    uint iq = q0 + myq;
+
+    for (uint idx = tid; idx < QB * HD; idx += 256u) {
+        uint qi = idx / HD;
+        uint d = idx - qi * HD;
+        uint i = q0 + qi;
+        qs[qi * HS + d] = (i < p.nTok) ? q[(i * p.nHead + h) * HD + d] : 0.0;
+    }
+    if (tid < QB) {
+        sm[tid] = -1e30;
+        sl[tid] = 0.0;
+    }
+    float acc[16];
+    for (uint j2 = 0u; j2 < 16u; j2++) {
+        acc[j2] = 0.0;
+    }
+    uint maxJ = (p.causal == 1u) ? min(q0 + QB, p.nTok) : p.nTok;
+    barrier();
+
+    for (uint t0 = 0u; t0 < maxJ; t0 += KT) {
+        for (uint idx = tid; idx < KT * HD; idx += 256u) {
+            uint e = idx / HD;
+            uint d = idx - e * HD;
+            uint j = t0 + e;
+            kvs[e * HS + d] = (j < p.nTok) ? k[(j * p.nHeadKV + kvh) * HD + d] : 0.0;
+        }
+        barrier();
+        float dot = 0.0;
+        for (uint d = 0u; d < HD; d++) {
+            dot += qs[myq * HS + d] * kvs[col * HS + d];
+        }
+        uint jk = t0 + col;
+        bool valid = iq < p.nTok && jk < p.nTok && (p.causal == 0u || jk <= iq);
+        float s = valid ? dot * p.scale : -1e30;
+        float mOld = sm[myq];
+        float mNew = max(mOld, subgroupClusteredMax(s, 16u));
+        float pe = valid ? exp(s - mNew) : 0.0;
+        float psum = subgroupClusteredAdd(pe, 16u);
+        float corr = exp(mOld - mNew);
+        S[myq * KT + col] = pe;
+        barrier();  // K reads, sm reads and S writes done
+        if (col == 0u) {
+            sm[myq] = mNew;
+            sl[myq] = sl[myq] * corr + psum;
+        }
+        for (uint idx = tid; idx < KT * HD; idx += 256u) {
+            uint e = idx / HD;
+            uint d = idx - e * HD;
+            uint j = t0 + e;
+            kvs[e * HS + d] = (j < p.nTok) ? v[(j * p.nHeadKV + kvh) * HD + d] : 0.0;
+        }
+        barrier();
+        for (uint j2 = 0u; j2 < 16u; j2++) {
+            acc[j2] *= corr;
+        }
+        for (uint e = 0u; e < KT; e++) {
+            float pp = S[myq * KT + e];
+            for (uint j2 = 0u; j2 < 16u; j2++) {
+                acc[j2] += pp * kvs[e * HS + col + 16u * j2];
+            }
+        }
+        barrier();  // V reads done before the next K tile
+    }
+    if (iq < p.nTok) {
+        float inv = 1.0 / sl[myq];
+        for (uint j2 = 0u; j2 < 16u; j2++) {
+            o[(iq * p.nHead + h) * HD + col + 16u * j2] = acc[j2] * inv;
+        }
+    }
+}

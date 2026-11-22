@@ -1,0 +1,87 @@
+#version 450
+
+// GatedDeltaNet forward, subgroup-parallel variant of gated_delta_net.comp.
+// Same bindings and push constants. One 32-lane subgroup per (head, state row j);
+// lane l owns row elements i = l + 32*r (r < 8, so S_v <= 256), kept in registers.
+// Per token: decay the row, kv = row.k, delta = (v_j - kv) * beta,
+// row += k * delta, out_j = (row.q) * scale. The dot products are subgroupAdd
+// reductions, so results match the serial kernel to rounding (not bit-exact).
+// Requires 32-lane subgroups (4 per 128-invocation workgroup): NVIDIA only.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 128) in;
+
+#define MAXR 8
+
+layout(binding = 0) readonly  buffer Q   { float q[];   };
+layout(binding = 1) readonly  buffer K   { float k[];   };
+layout(binding = 2) readonly  buffer V   { float v[];   };
+layout(binding = 3) readonly  buffer G   { float g[];   };
+layout(binding = 4) readonly  buffer Beta { float beta[]; };
+layout(binding = 5) readonly  buffer State { float state[]; };
+layout(binding = 6)           buffer Out  { float outv[];  };
+layout(binding = 7)           buffer NState { float nstate[]; };
+
+layout(push_constant) uniform P {
+    uint  sv;
+    uint  h;
+    uint  nTok;
+    uint  gstride;
+    float scale;
+    uint  kda;
+    uint  qkh;
+} p;
+
+void main() {
+    uint rowId = gl_WorkGroupID.x * 4u + gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint hh = rowId / p.sv;
+    uint j = rowId - hh * p.sv;
+    if (hh >= p.h || p.sv > 32u * MAXR) {
+        return;  // uniform across the subgroup
+    }
+    uint rbase = hh * p.sv * p.sv + j * p.sv;
+    float row[MAXR];
+    for (uint r = 0u; r < MAXR; r++) {
+        uint i = lane + 32u * r;
+        row[r] = (i < p.sv) ? state[rbase + i] : 0.0;
+    }
+    uint qh = hh % p.qkh;
+    for (uint t = 0u; t < p.nTok; t++) {
+        uint qbase = (t * p.qkh + qh) * p.sv;
+        uint base = (t * p.h + hh) * p.sv;
+        uint gOff = (t * p.h + hh) * p.gstride;
+        float b = beta[t * p.h + hh];
+        float sdec = (p.kda == 1u) ? 1.0 : exp(g[gOff]);
+        float kk[MAXR];
+        float part = 0.0;
+        for (uint r = 0u; r < MAXR; r++) {
+            uint i = lane + 32u * r;
+            bool ok = i < p.sv;
+            float dec = (p.kda == 1u) ? (ok ? exp(g[gOff + i]) : 1.0) : sdec;
+            row[r] *= dec;
+            kk[r] = ok ? k[qbase + i] : 0.0;
+            part += row[r] * kk[r];
+        }
+        float kv = subgroupAdd(part);
+        float delta = (v[base + j] - kv) * b;
+        float part2 = 0.0;
+        for (uint r = 0u; r < MAXR; r++) {
+            uint i = lane + 32u * r;
+            row[r] += kk[r] * delta;
+            part2 += row[r] * ((i < p.sv) ? q[qbase + i] : 0.0);
+        }
+        float acc = subgroupAdd(part2);
+        if (lane == 0u) {
+            outv[base + j] = acc * p.scale;
+        }
+    }
+    for (uint r = 0u; r < MAXR; r++) {
+        uint i = lane + 32u * r;
+        if (i < p.sv) {
+            nstate[rbase + i] = row[r];
+        }
+    }
+}

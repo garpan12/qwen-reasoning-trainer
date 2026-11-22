@@ -81,6 +81,9 @@ const (
 	// Vulkan 1.1 / extension struct type tags.
 	vkStructurePhysicalDeviceFeatures2                    = 1000059000
 	vkStructurePhysicalDeviceShaderAtomicFloatFeaturesEXT = 1000260000
+	vkStructurePhysicalDeviceShaderFloat16Int8Features    = 1000082000
+	vkStructurePhysicalDeviceVulkanMemoryModelFeatures    = 1000211000
+	vkStructurePhysicalDeviceCooperativeMatrixFeaturesKHR = 1000506000
 
 	vkBufferUsageTransferSrc     = 0x00000001
 	vkBufferUsageTransferDst     = 0x00000002
@@ -196,6 +199,37 @@ type physicalDeviceShaderAtomicFloatFeatures struct {
 	shaderImageFloat32AtomicAdd     uint32
 	sparseImageFloat32Atomics       uint32
 	sparseImageFloat32AtomicAdd     uint32
+}
+
+// physicalDeviceShaderFloat16Int8Features mirrors
+// VkPhysicalDeviceShaderFloat16Int8Features.
+type physicalDeviceShaderFloat16Int8Features struct {
+	sType         uint32
+	_             uint32
+	pNext         uintptr
+	shaderFloat16 uint32
+	shaderInt8    uint32
+}
+
+// physicalDeviceVulkanMemoryModelFeatures mirrors
+// VkPhysicalDeviceVulkanMemoryModelFeatures.
+type physicalDeviceVulkanMemoryModelFeatures struct {
+	sType                                         uint32
+	_                                             uint32
+	pNext                                         uintptr
+	vulkanMemoryModel                             uint32
+	vulkanMemoryModelDeviceScope                  uint32
+	vulkanMemoryModelAvailabilityVisibilityChains uint32
+}
+
+// physicalDeviceCooperativeMatrixFeatures mirrors
+// VkPhysicalDeviceCooperativeMatrixFeaturesKHR.
+type physicalDeviceCooperativeMatrixFeatures struct {
+	sType                               uint32
+	_                                   uint32
+	pNext                               uintptr
+	cooperativeMatrix                   uint32
+	cooperativeMatrixRobustBufferAccess uint32
 }
 
 type bufferCreateInfo struct {
@@ -620,6 +654,9 @@ type Backend struct {
 	// fallback.
 	flashAttention bool
 	vendorID       uint32 // VkPhysicalDeviceProperties.vendorID of the chosen device
+	// coopMat reports that VK_KHR_cooperative_matrix (+ shaderFloat16 and the
+	// Vulkan memory model) was enabled, so the tensor-core *_cm_* GEMMs can run.
+	coopMat bool
 
 	// noPool disables buffer recycling (every Free destroys the buffer). Tests
 	// only.
@@ -855,6 +892,30 @@ func New() (*Backend, error) {
 		runtime.KeepAlive(f2)
 	}
 
+	// Optional: tensor-core GEMMs (VK_KHR_cooperative_matrix with fp16 inputs and
+	// the Vulkan memory model). QWEN38_COOPMAT=0 leaves them disabled.
+	coopFeatures := &physicalDeviceCooperativeMatrixFeatures{sType: vkStructurePhysicalDeviceCooperativeMatrixFeaturesKHR}
+	f16Features := &physicalDeviceShaderFloat16Int8Features{sType: vkStructurePhysicalDeviceShaderFloat16Int8Features}
+	vmmFeatures := &physicalDeviceVulkanMemoryModelFeatures{sType: vkStructurePhysicalDeviceVulkanMemoryModelFeatures}
+	coopExts := []string{"VK_KHR_cooperative_matrix", "VK_KHR_shader_float16_int8", "VK_KHR_vulkan_memory_model"}
+	enableCoop := false
+	if os.Getenv("QWEN38_COOPMAT") != "0" && v.GetPhysicalDeviceFeatures2 != 0 {
+		have := true
+		for _, e := range coopExts {
+			have = have && hasDeviceExtension(v, b.physicalDevice, e)
+		}
+		if have {
+			vmmFeatures.pNext = uintptr(unsafe.Pointer(f16Features))
+			f16Features.pNext = uintptr(unsafe.Pointer(coopFeatures))
+			f2 := new(physicalDeviceFeatures2)
+			f2.sType = vkStructurePhysicalDeviceFeatures2
+			f2.pNext = uintptr(unsafe.Pointer(vmmFeatures))
+			vkCall(v.GetPhysicalDeviceFeatures2, b.physicalDevice, uintptr(unsafe.Pointer(f2)))
+			enableCoop = coopFeatures.cooperativeMatrix != 0 && f16Features.shaderFloat16 != 0 && vmmFeatures.vulkanMemoryModel != 0
+			runtime.KeepAlive(f2)
+		}
+	}
+
 	prio := float32(1.0)
 	qci := deviceQueueCreateInfo{
 		sType:            vkStructureDeviceQueueCreateInfo,
@@ -867,13 +928,35 @@ func New() (*Backend, error) {
 		queueCreateInfoCount: 1,
 		pQueueCreateInfos:    uintptr(unsafe.Pointer(&qci)),
 	}
-	extNameBytes := append([]byte("VK_EXT_shader_atomic_float"), 0)
-	var extNames [1]uintptr
+	var extNameBytes [][]byte
+	var extNames []uintptr
+	addExt := func(name string) {
+		nb := append([]byte(name), 0)
+		extNameBytes = append(extNameBytes, nb)
+		extNames = append(extNames, uintptr(unsafe.Pointer(&nb[0])))
+	}
+	// Feature chain: atomics -> memory model -> float16 -> cooperative matrix.
+	var chainHead uintptr
+	if enableCoop {
+		coopFeatures.cooperativeMatrixRobustBufferAccess = 0
+		f16Features.shaderInt8 = 0
+		vmmFeatures.pNext = uintptr(unsafe.Pointer(f16Features))
+		f16Features.pNext = uintptr(unsafe.Pointer(coopFeatures))
+		coopFeatures.pNext = 0
+		chainHead = uintptr(unsafe.Pointer(vmmFeatures))
+		for _, e := range coopExts {
+			addExt(e)
+		}
+	}
 	if enableAtomics {
 		atomicFeatures.shaderBufferFloat32AtomicAdd = 1
-		dci.pNext = uintptr(unsafe.Pointer(atomicFeatures))
-		extNames[0] = uintptr(unsafe.Pointer(&extNameBytes[0]))
-		dci.enabledExtensionCount = 1
+		atomicFeatures.pNext = chainHead
+		chainHead = uintptr(unsafe.Pointer(atomicFeatures))
+		addExt("VK_EXT_shader_atomic_float")
+	}
+	dci.pNext = chainHead
+	if len(extNames) > 0 {
+		dci.enabledExtensionCount = uint32(len(extNames))
 		dci.ppEnabledExtensionNames = uintptr(unsafe.Pointer(&extNames[0]))
 	}
 	var device uintptr
@@ -882,8 +965,13 @@ func New() (*Backend, error) {
 		return nil, fmt.Errorf("vulkan: vkCreateDevice failed (%d)", int32(res))
 	}
 	runtime.KeepAlive(extNameBytes)
+	runtime.KeepAlive(extNames)
 	runtime.KeepAlive(atomicFeatures)
+	runtime.KeepAlive(coopFeatures)
+	runtime.KeepAlive(f16Features)
+	runtime.KeepAlive(vmmFeatures)
 	b.device = device
+	b.coopMat = enableCoop
 	vkCall(v.GetDeviceQueue, device, uintptr(b.queueFamily), 0, uintptr(unsafe.Pointer(&b.queue)))
 
 	cpi := commandPoolCreateInfo{sType: vkStructureCommandPoolCi, flags: 0, queueFamilyIndex: b.queueFamily}
