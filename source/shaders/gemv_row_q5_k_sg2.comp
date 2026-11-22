@@ -1,0 +1,107 @@
+#version 450
+#define NR 2u
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Row-cooperative Q5_K GEMV, coalesced: y[n] = sum_k dequant(W[n,k]) * x[k].
+// 2 output rows per 32-lane subgroup (8 per 128-invocation workgroup).
+// Lanes take consecutive 16-byte chunks of the row's quant data, so each warp
+// load is contiguous; the subgroupAdd gives y[n].
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly  buffer W { uvec4 data[]; };
+layout(binding = 1) readonly  buffer X { vec4 x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint rowBase;
+} p;
+
+// Byte i of a 16-byte block header.
+uint hb(uvec4 h, uint i) { return (h[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+// Scale and min of sub-block s (0..7) from a Q4_K/Q5_K header (d, dmin, 12
+// packed 6-bit scales), as in the get_scale_min_k4 layout.
+void scaleMin(uvec4 h, uint s, out float dl, out float ml) {
+    vec2 dm = unpackHalf2x16(h.x);
+    uint sc, m;
+    if (s < 4u) {
+        sc = hb(h, 4u + s) & 63u;
+        m = hb(h, 8u + s) & 63u;
+    } else {
+        sc = (hb(h, 8u + s) & 0xFu) | ((hb(h, s) >> 6u) << 4u);
+        m = (hb(h, 8u + s) >> 4u) | ((hb(h, 4u + s) >> 6u) << 4u);
+    }
+    dl = dm.x * float(sc);
+    ml = dm.y * float(m);
+}
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    // NR rows per subgroup; x chunks are loaded once for all of them.
+    uint n0 = p.rowBase + (gl_WorkGroupID.x * 4u + gl_SubgroupID) * NR;
+    if (n0 >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 256u;
+    uint rb[NR];
+    float acc[NR];
+    for (uint r = 0u; r < NR; r++) {
+        rb[r] = min(n0 + r, p.N - 1u) * bpr * 11u;
+        acc[r] = 0.0;
+    }
+    for (uint u = lane; u < bpr * 8u; u += 32u) {
+        uint b = u >> 3u;
+        uint c = u & 7u;
+        uint g = c >> 1u;
+        uint s0 = g * 2u;
+        uint s1 = s0 + 1u;
+        uint x0 = (b * 256u + g * 64u) / 4u + (c & 1u) * 4u;
+        vec4 xl[4];
+        vec4 xu[4];
+        vec4 sxl = vec4(0.0);
+        vec4 sxu = vec4(0.0);
+        for (uint i = 0u; i < 4u; i++) {
+            xl[i] = x[x0 + i];
+            xu[i] = x[x0 + 8u + i];
+            sxl += xl[i];
+            sxu += xu[i];
+        }
+        float sumL = sxl.x + sxl.y + sxl.z + sxl.w;
+        float sumU = sxu.x + sxu.y + sxu.z + sxu.w;
+        for (uint r = 0u; r < NR; r++) {
+            uint bb = rb[r] + b * 11u;
+            uvec4 h = data[bb];
+            uvec4 qh = data[bb + 1u + (c & 1u)];
+            uvec4 q = data[bb + 3u + c];
+            float dl0, ml0, dl1, ml1;
+            scaleMin(h, s0, dl0, ml0);
+            scaleMin(h, s1, dl1, ml1);
+            float lo = 0.0;
+            float hi = 0.0;
+            for (uint i = 0u; i < 4u; i++) {
+                uint w = q[i];
+                uint hw = qh[i];
+                lo += dot(vec4(float((w & 0xFu) | (((hw >> s0) & 1u) << 4u)),
+                               float(((w >> 8u) & 0xFu) | (((hw >> (8u + s0)) & 1u) << 4u)),
+                               float(((w >> 16u) & 0xFu) | (((hw >> (16u + s0)) & 1u) << 4u)),
+                               float(((w >> 24u) & 0xFu) | (((hw >> (24u + s0)) & 1u) << 4u))), xl[i]);
+                hi += dot(vec4(float(((w >> 4u) & 0xFu) | (((hw >> s1) & 1u) << 4u)),
+                               float(((w >> 12u) & 0xFu) | (((hw >> (8u + s1)) & 1u) << 4u)),
+                               float(((w >> 20u) & 0xFu) | (((hw >> (16u + s1)) & 1u) << 4u)),
+                               float((w >> 28u) | (((hw >> (24u + s1)) & 1u) << 4u))), xu[i]);
+            }
+            acc[r] += dl0 * lo - ml0 * sumL + dl1 * hi - ml1 * sumU;
+        }
+    }
+    for (uint r = 0u; r < NR; r++) {
+        float t = subgroupAdd(acc[r]);
+        if (lane == 0u && n0 + r < p.N) {
+            y[n0 + r] = t;
+        }
+    }
+}

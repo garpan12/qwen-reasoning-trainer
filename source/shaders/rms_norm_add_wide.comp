@@ -1,0 +1,63 @@
+#version 450
+
+// Fused residual add + RMSNorm, wide variant of rms_norm_add.comp for decode:
+// one 1024-lane workgroup per row (same bindings and push constants), with a
+// subgroupAdd + shared-memory reduction.
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 1024) in;
+
+layout(binding = 0) readonly  buffer A { float a[]; };
+layout(binding = 1) readonly  buffer R { float r[]; };
+layout(binding = 2) readonly  buffer W { float w[]; };
+layout(binding = 3) writeonly buffer S { float s[]; };
+layout(binding = 4) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint  rowLen;
+    uint  rows;
+    float eps;
+    uint  hasW;
+} p;
+
+shared float red[32];
+shared float invs;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= p.rows) {
+        return;
+    }
+    uint lane = gl_LocalInvocationIndex;
+    uint base = row * p.rowLen;
+    float ss = 0.0;
+    for (uint i = lane; i < p.rowLen; i += 1024u) {
+        float v = a[base + i] + r[base + i];
+        ss += v * v;
+    }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) {
+        red[gl_SubgroupID] = ss;
+    }
+    barrier();
+    if (lane == 0u) {
+        float t = 0.0;
+        for (uint k = 0u; k < gl_NumSubgroups; k++) {
+            t += red[k];
+        }
+        invs = 1.0 / sqrt(t / float(p.rowLen) + p.eps);
+    }
+    barrier();
+    float inv = invs;
+    for (uint i = lane; i < p.rowLen; i += 1024u) {
+        float sum = a[base + i] + r[base + i];
+        s[base + i] = sum;
+        float v = sum * inv;
+        if (p.hasW == 1u) {
+            v *= w[i];
+        }
+        y[base + i] = v;
+    }
+}

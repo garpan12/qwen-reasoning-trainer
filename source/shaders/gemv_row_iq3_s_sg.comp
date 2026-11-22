@@ -1,0 +1,4 @@
+#version 450
+// Subgroup row IQ3_S GEMV via the per-element decoder; see gemv_row_elem_body.glsl.
+#define QDECODE(n, kk) deq_iq3_s(n, kk)
+#include "gemv_row_elem_body.glsl"

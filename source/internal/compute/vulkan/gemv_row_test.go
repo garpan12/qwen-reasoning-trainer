@@ -28,6 +28,9 @@ func TestVulkanGEMVRowParity(t *testing.T) {
 		{quant.TypeQ5_K, 5120, 257},
 		{quant.TypeQ6_K, 5120, 257},
 		{quant.TypeIQ4_XS, 5120, 257},
+		{quant.TypeIQ4_NL, 5120, 257},
+		{quant.TypeIQ4_NL, 96, 33},
+		{quant.TypeIQ3_S, 5120, 257},
 		{quant.TypeQ4_K, 256, 65540},
 	}
 	for _, tc := range cases {

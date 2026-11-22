@@ -65,8 +65,9 @@ func envInt(key string, def int) int {
 
 // Split-plan tuning knobs, overridable for benchmarks.
 var (
-	splitTargetWorkGroups = envInt("QWEN38_SPLIT_TARGET", 256)
-	splitMinKeysPerSplit  = envInt("QWEN38_SPLIT_MIN_KEYS", 256)
+	splitTargetWorkGroups = envInt("QWEN38_SPLIT_TARGET", 1024)
+	splitMinKeysPerSplit  = envInt("QWEN38_SPLIT_MIN_KEYS", 64)
+	splitMaxSplits        = envInt("QWEN38_SPLIT_MAX", 512)
 )
 
 // matmulWShaders maps a quantized type to its fused dequantize+GEMM shader
@@ -483,7 +484,11 @@ func (b *Backend) RMSNormAdd(a, add, w compute.Buffer, eps float32) (compute.Buf
 		}
 		hasW = 1
 	}
-	if err := b.dispatch("rms_norm_add", []*buffer{x, r, wb, sum, out},
+	normShader := "rms_norm_add"
+	if rows <= 4 && rowLen >= 1024 && b.gemvSubgroup() {
+		normShader = "rms_norm_add_wide" // decode: one wide workgroup per row
+	}
+	if err := b.dispatch(normShader, []*buffer{x, r, wb, sum, out},
 		push(uint32(rowLen), uint32(rows), eps, hasW), [3]uint32{uint32(rows), 1, 1}); err != nil {
 		b.Free(sum)
 		b.Free(out)
@@ -1531,6 +1536,7 @@ func (b *Backend) WriteKV(cache compute.Buffer, byteOffset int, data []byte) err
 		return err
 	}
 	region := bufferCopy{srcOffset: 0, dstOffset: x.offset + uint64(byteOffset), size: uint64(len(data))}
+	b.flushHazards()
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, staging.buf, x.buf, 1, uintptr(unsafe.Pointer(&region)))
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,
@@ -1550,7 +1556,7 @@ func cachedSplitPlan(nKV, nQ, nHead, nHeadKV int) (keysPerSplit, splits int, ok 
 	// merges query heads, so its natural parallelism is nHeadKV per split
 	// instead of nHead*nQ per split.
 	targetWorkGroups := splitTargetWorkGroups
-	const maxSplits = 128
+	maxSplits := splitMaxSplits
 	minKeysPerSplit := splitMinKeysPerSplit
 	baseGroups := nHead * nQ
 	if nQ == 1 && nHead/nHeadKV == 6 {
@@ -2246,6 +2252,7 @@ func (b *Backend) zeroFill(x *buffer) error {
 	if err := b.beginBatch(); err != nil {
 		return err
 	}
+	b.flushHazards()
 	vkCall(b.vk.CmdFillBuffer, b.cmdBuffer, x.buf, uintptr(x.offset), uintptr(x.size&^3), 0)
 	barrier := memoryBarrier{
 		sType:         vkStructureMemoryBarrier,
@@ -2661,6 +2668,7 @@ func (b *Backend) Copy(dst, src compute.Buffer) error {
 	// Prior compute writes to src must be visible to the transfer stage, and
 	// the result visible to later compute.
 	pre := memoryBarrier{sType: vkStructureMemoryBarrier, srcAccessMask: vkAccessShaderWrite, dstAccessMask: vkAccessTransferRead}
+	b.flushHazards()
 	vkCall(b.vk.CmdPipelineBarrier, b.cmdBuffer, vkPipelineStageCompute, vkPipelineStageTransfer, 0, 1, uintptr(unsafe.Pointer(&pre)), 0, 0, 0, 0)
 	vkCall(b.vk.CmdCopyBuffer, b.cmdBuffer, s.buf, d.buf, 1, uintptr(unsafe.Pointer(&region)))
 	post := memoryBarrier{sType: vkStructureMemoryBarrier, srcAccessMask: vkAccessTransferWrite, dstAccessMask: vkAccessShaderRead | vkAccessShaderWrite}
@@ -2797,6 +2805,14 @@ const vendorNVIDIA = 0x10DE
 // bandwidth and was 44% of decode GPU time, while gemv_row_q5_k runs ~3x faster
 // (decode 11.5 -> 14.7 tok/s). QWEN38_Q5K_ROW=1/0 forces either choice.
 func (b *Backend) rowGEMVShader(typ quant.Type) (string, bool) {
+	// IQ4_NL has only the subgroup row kernel (gemv_row_iq4_nl_sg).
+	if typ == quant.TypeIQ4_NL {
+		return "gemv_row_iq4_nl", b.gemvSubgroup()
+	}
+	// IQ3_S: subgroup row kernel over the per-element decoder.
+	if typ == quant.TypeIQ3_S && b.gemvSubgroup() {
+		return "gemv_row_iq3_s", true
+	}
 	name, ok := gemvRowShaders[typ]
 	if ok && typ == quant.TypeQ5_K {
 		switch os.Getenv("QWEN38_Q5K_ROW") {
@@ -2810,6 +2826,13 @@ func (b *Backend) rowGEMVShader(typ quant.Type) (string, bool) {
 		}
 	}
 	return name, ok
+}
+
+// gemvSubgroup selects the gemv_row_<t>_sg variants (one 32-lane subgroup per
+// row, subgroupAdd reduction) for single-token decode. NVIDIA only;
+// QWEN38_GEMV_SG=0 keeps the one-workgroup-per-row kernels.
+func (b *Backend) gemvSubgroup() bool {
+	return b.vendorID == vendorNVIDIA && os.Getenv("QWEN38_GEMV_SG") != "0"
 }
 
 // gemmM128 selects the 128-token-tile fused GEMMs (matmul_wq_m128_*,
@@ -2850,15 +2873,33 @@ func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
 		return nil, err
 	}
 	if rowCooperative {
-		// One workgroup per row; dispatch in chunks to stay below the
-		// per-dimension group limit.
-		for base := uint32(0); base < uint32(n); base += maxWorkGroups {
+		// One workgroup per row (the _sg variants: 4 rows per workgroup, one
+		// subgroup each); dispatch in chunks to stay below the per-dimension
+		// group limit.
+		rowsPerGroup := uint32(1)
+		if b.gemvSubgroup() {
+			name += "_sg"
+			rowsPerGroup = 4
+			// Several rows per subgroup reuse each activation load (measured
+			// best: 4 for IQ4_XS, 2 for Q5_K). QWEN38_GEMV_NR=1 disables.
+			if os.Getenv("QWEN38_GEMV_NR") != "1" {
+				switch w.typ {
+				case quant.TypeIQ4_XS:
+					name += "4"
+					rowsPerGroup = 16
+				case quant.TypeQ5_K:
+					name += "2"
+					rowsPerGroup = 8
+				}
+			}
+		}
+		for base := uint32(0); base < uint32(n); base += maxWorkGroups * rowsPerGroup {
 			rows := uint32(n) - base
-			if rows > maxWorkGroups {
-				rows = maxWorkGroups
+			if rows > maxWorkGroups*rowsPerGroup {
+				rows = maxWorkGroups * rowsPerGroup
 			}
 			pc := push(uint32(k), uint32(n), base)
-			if err := b.dispatch(name, []*buffer{w, x, out}, pc, [3]uint32{rows, 1, 1}); err != nil {
+			if err := b.dispatch(name, []*buffer{w, x, out}, pc, [3]uint32{ceilDiv(rows, rowsPerGroup), 1, 1}); err != nil {
 				b.Free(out)
 				return nil, err
 			}
