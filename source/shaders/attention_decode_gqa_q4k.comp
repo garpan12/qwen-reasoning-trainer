@@ -12,6 +12,9 @@
 // elements 32s..32s+31 (group j = s/2: low nibbles of bytes j*32.. for s even,
 // high nibbles for s odd).
 
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
 layout(local_size_x = 64) in;
 
 layout(binding = 0) readonly  buffer Q { float q[]; };
@@ -44,6 +47,9 @@ shared float logits[TILE][GROUP];
 shared float mval[GROUP];
 shared float lval[GROUP];
 shared float corr[GROUP];
+shared vec2 vsc[TILE][8];          // per key: V (scale, min) of its 8 sub-blocks
+shared float redm[2][GROUP];
+shared float reds[2][GROUP];
 
 uint hb(uvec4 h, uint i) { return (h[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
 
@@ -62,16 +68,16 @@ void scaleMin(uvec4 h, uint s, out float dl, out float ml) {
     ml = dm.y * float(m);
 }
 
-// V elements idx and idx+1 (idx even) of the block starting at uint word w0.
-vec2 dequantV2(uint w0, uvec4 h, uint idx) {
+// V elements idx and idx+1 (idx even) of tile key e (block at uint word w0),
+// using that key's sub-block scales from vsc.
+vec2 dequantV2(uint w0, uint e, uint idx) {
     uint j = idx >> 6u;
     uint r = idx & 63u;
     uint l = r & 31u;
     uint word = vbuf.d[w0 + 4u + j * 8u + (l >> 2u)] >> ((l & 3u) * 8u);
     uint shift = (r < 32u) ? 0u : 4u;
-    float dl, ml;
-    scaleMin(h, j * 2u + (r >> 5u), dl, ml);
-    return vec2(dl * float((word >> shift) & 0xFu) - ml, dl * float((word >> (8u + shift)) & 0xFu) - ml);
+    vec2 sm = vsc[e][j * 2u + (r >> 5u)];
+    return vec2(sm.x * float((word >> shift) & 0xFu) - sm.y, sm.x * float((word >> (8u + shift)) & 0xFu) - sm.y);
 }
 
 void main() {
@@ -162,24 +168,43 @@ void main() {
             for (uint g = 0u; g < GROUP; g++) {
                 logits[lane][g] = dots[g] * p.scale;
             }
+            uint vw = (kv * p.capacity + t0 + lane) * 36u;
+            uvec4 hv = uvec4(vbuf.d[vw], vbuf.d[vw + 1u], vbuf.d[vw + 2u], vbuf.d[vw + 3u]);
+            for (uint sb = 0u; sb < 8u; sb++) {
+                float dl, ml;
+                scaleMin(hv, sb, dl, ml);
+                vsc[lane][sb] = vec2(dl, ml);
+            }
         }
         barrier();
 
+        // Softmax update: lane e owns key e for all heads.
+        uint sgi = gl_SubgroupID;
+        bool valid = lane < tlen;
+        for (uint g = 0u; g < GROUP; g++) {
+            float mx = subgroupMax(valid ? logits[lane][g] : -1e30);
+            if (subgroupElect()) {
+                redm[sgi][g] = mx;
+            }
+        }
+        barrier();
+        for (uint g = 0u; g < GROUP; g++) {
+            float newM = max(mval[g], max(redm[0][g], redm[1][g]));
+            float pe = valid ? exp(logits[lane][g] - newM) : 0.0;
+            if (valid) {
+                logits[lane][g] = pe;
+            }
+            float sm = subgroupAdd(pe);
+            if (subgroupElect()) {
+                reds[sgi][g] = sm;
+            }
+        }
+        barrier();
         if (lane < GROUP) {
             uint g = lane;
-            float tileMax = -1e30;
-            for (uint e = 0u; e < tlen; e++) {
-                tileMax = max(tileMax, logits[e][g]);
-            }
-            float newM = max(mval[g], tileMax);
+            float newM = max(mval[g], max(redm[0][g], redm[1][g]));
             float c = exp(mval[g] - newM);
-            float sum = 0.0;
-            for (uint e = 0u; e < tlen; e++) {
-                float pe = exp(logits[e][g] - newM);
-                logits[e][g] = pe;
-                sum += pe;
-            }
-            lval[g] = lval[g] * c + sum;
+            lval[g] = lval[g] * c + reds[0][g] + reds[1][g];
             mval[g] = newM;
             corr[g] = c;
         }
@@ -195,9 +220,8 @@ void main() {
         // V: this lane owns dims 2*lane, 2*lane+1, 2*lane+128, 2*lane+129.
         for (uint e = 0u; e < tlen; e++) {
             uint w0 = (kv * p.capacity + t0 + e) * 36u;
-            uvec4 h = uvec4(vbuf.d[w0], vbuf.d[w0 + 1u], vbuf.d[w0 + 2u], vbuf.d[w0 + 3u]);
-            vec2 va = dequantV2(w0, h, lane * 2u);
-            vec2 vb = dequantV2(w0, h, lane * 2u + 128u);
+            vec2 va = dequantV2(w0, e, lane * 2u);
+            vec2 vb = dequantV2(w0, e, lane * 2u + 128u);
             for (uint g = 0u; g < GROUP; g++) {
                 float w = logits[e][g];
                 acc[g * 4u] += w * va.x;
