@@ -2881,13 +2881,14 @@ func (b *Backend) gemv(w, x *buffer) (compute.Buffer, error) {
 			name += "_sg"
 			rowsPerGroup = 4
 			// Several rows per subgroup reuse each activation load (measured
-			// best: 4 for IQ4_XS, 2 for Q5_K). QWEN38_GEMV_NR=1 disables.
+			// best: IQ4_XS 4, IQ4_NL 4, Q5_K 2, Q4_K 2). QWEN38_GEMV_NR=1
+			// restores one row per subgroup.
 			if os.Getenv("QWEN38_GEMV_NR") != "1" {
 				switch w.typ {
-				case quant.TypeIQ4_XS:
+				case quant.TypeIQ4_XS, quant.TypeIQ4_NL:
 					name += "4"
 					rowsPerGroup = 16
-				case quant.TypeQ5_K:
+				case quant.TypeQ5_K, quant.TypeQ4_K:
 					name += "2"
 					rowsPerGroup = 8
 				}

@@ -1,0 +1,76 @@
+#version 450
+#define NR 4u
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Row-cooperative IQ4_NL GEMV: y[n] = sum_k dequant(W[n,k]) * x[k].
+// 4 output rows per 32-lane subgroup (16 per 128-invocation workgroup);
+// lanes take consecutive 18-byte blocks (d, then 16 bytes whose low/high
+// nibbles index the non-linear table for elements j and j + 16).
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly  buffer W { uint data[]; };
+layout(binding = 1) readonly  buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    uint K;
+    uint N;
+    uint rowBase;
+} p;
+
+shared float KV[16];
+
+const float KVALS[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+
+// 16-bit word at an even byte offset.
+uint hw(uint o) { return (data[o >> 2u] >> ((o & 2u) * 8u)) & 0xFFFFu; }
+
+void main() {
+    if (gl_LocalInvocationIndex < 16u) {
+        KV[gl_LocalInvocationIndex] = KVALS[gl_LocalInvocationIndex];
+    }
+    barrier();
+    uint lane = gl_SubgroupInvocationID;
+    // NR rows per subgroup; the 32 x values of a block are loaded once for all.
+    uint n0 = p.rowBase + (gl_WorkGroupID.x * 4u + gl_SubgroupID) * NR;
+    if (n0 >= p.N) {
+        return;
+    }
+    uint bpr = p.K / 32u;
+    float acc[NR];
+    uint ro[NR];
+    for (uint r = 0u; r < NR; r++) {
+        acc[r] = 0.0;
+        ro[r] = min(n0 + r, p.N - 1u) * bpr * 18u;
+    }
+    for (uint blk = lane; blk < bpr; blk += 32u) {
+        uint xb = blk * 32u;
+        float xv[32];
+        for (uint j = 0u; j < 32u; j++) {
+            xv[j] = x[xb + j];
+        }
+        for (uint r = 0u; r < NR; r++) {
+            uint o = ro[r] + blk * 18u;
+            float d = unpackHalf2x16(hw(o)).x;
+            float s = 0.0;
+            for (uint k = 0u; k < 8u; k++) {
+                uint v = hw(o + 2u + 2u * k);
+                uint j = 2u * k;
+                s += KV[v & 0xFu] * xv[j] + KV[(v >> 4u) & 0xFu] * xv[j + 16u];
+                s += KV[(v >> 8u) & 0xFu] * xv[j + 1u] + KV[v >> 12u] * xv[j + 17u];
+            }
+            acc[r] += d * s;
+        }
+    }
+    for (uint r = 0u; r < NR; r++) {
+        float t = subgroupAdd(acc[r]);
+        if (lane == 0u && n0 + r < p.N) {
+            y[n0 + r] = t;
+        }
+    }
+}
