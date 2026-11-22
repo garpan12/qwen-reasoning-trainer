@@ -1,0 +1,20 @@
+#version 450
+
+// Packed fp16 copy of an fp32 tensor scaled by s: out[i] = (x[2i], x[2i+1]) * s.
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer X { vec2 x[]; };
+layout(binding = 1) writeonly buffer O { uint o[]; };
+
+layout(push_constant) uniform P {
+    uint  pairs;
+    float s;
+} p;
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.pairs; i += stride) {
+        o[i] = packHalf2x16(x[i] * p.s);
+    }
+}

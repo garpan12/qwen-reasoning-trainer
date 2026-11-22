@@ -21,7 +21,7 @@ func TestFlashTCParity(t *testing.T) {
 	defer vb.Close()
 	const hd, nHead, nHeadKV = 256, 24, 4
 	scale := float32(1.0 / math.Sqrt(float64(hd)))
-	for _, tc := range []struct{ nQ, nKV int }{{16, 16}, {64, 700}, {128, 2100}, {2048, 6000}} {
+	for _, tc := range []struct{ nQ, nKV int }{{16, 16}, {64, 64}, {64, 700}, {128, 2100}, {192, 1000}, {2048, 6000}} {
 		k := autograd.Random(401, 1.0, hd, nHeadKV, tc.nKV)
 		v := autograd.Random(402, 1.0, hd, nHeadKV, tc.nKV)
 		q := autograd.Random(403, 3.0, hd, nHead, tc.nQ)

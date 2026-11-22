@@ -1737,7 +1737,12 @@ func (b *Backend) AttentionCached(q, kcache, vcache compute.Buffer, nHead, nHead
 	const flashQueries = 16
 	if nQ > 4 {
 		blocks := (nQ + flashQueries - 1) / flashQueries
-		// Tensor-core prefill attention (opt-in while being validated).
+		// Tensor-core prefill attention (opt-in while being validated): the
+		// decode-once kernel (fp16 K/V written once per call), else the 16-query one.
+		if kb.typ == quant.TypeQ4_K && hd == 256 && nQ%16 == 0 && b.flashTC() && os.Getenv("QWEN38_FLASH_TC2") != "0" &&
+			nQ/16 <= maxPerDispatch && nHead <= maxPerDispatch {
+			return b.flashF16TC(qb, kb, vb, nQ, nKV, capacity, nHead, nHeadKV, qStart, scale)
+		}
 		if kb.typ == quant.TypeQ4_K && hd == 256 && nQ%flashQueries == 0 && b.flashTC() &&
 			blocks <= maxPerDispatch && nHead <= maxPerDispatch {
 			out, err := b.newF32Buffer(qb.dims...)
@@ -2972,6 +2977,69 @@ func (b *Backend) dequantElem(wb *buffer, typ string, k, n int) (*buffer, error)
 		groups = maxWorkGroups
 	}
 	if err := b.dispatch("dequant_e_"+typ, []*buffer{wb, out}, push(uint32(k), uint32(n), total, uint32(0)), [3]uint32{groups, 1, 1}); err != nil {
+		b.Free(out)
+		return nil, err
+	}
+	return out, nil
+}
+
+// flashF16TC runs decode-once tensor-core prefill attention: Q (scaled) and
+// the K/V history [0, nKV) are converted to fp16 once, then
+// attention_flash_f16s_tc stages 64-key tiles from those buffers in shared memory.
+func (b *Backend) flashF16TC(qb, kb, vb *buffer, nQ, nKV, capacity, nHead, nHeadKV int, qStart uint32, scale float32) (compute.Buffer, error) {
+	const hd = 256
+	var scratch []*buffer
+	defer func() {
+		for _, x := range scratch {
+			b.Free(x)
+		}
+	}()
+	alloc := func(words int) (*buffer, error) {
+		x, err := b.newF32Buffer(words)
+		if err == nil {
+			scratch = append(scratch, x)
+		}
+		return x, err
+	}
+	pairs := nQ * nHead * hd / 2
+	q16, err := alloc(pairs)
+	if err != nil {
+		return nil, err
+	}
+	groups := func(n int) [3]uint32 {
+		g := ceilDiv(uint32(n), 256)
+		if g > maxWorkGroups {
+			g = maxWorkGroups
+		}
+		return [3]uint32{g, 1, 1}
+	}
+	if err := b.dispatch("q_to_f16", []*buffer{qb, q16}, push(uint32(pairs), scale), groups(pairs)); err != nil {
+		return nil, err
+	}
+	kvWords := (nHeadKV*nKV + 64) * hd / 2 // + 64 zeroed rows of padding
+	k16, err := alloc(kvWords)
+	if err != nil {
+		return nil, err
+	}
+	v16, err := alloc(kvWords)
+	if err != nil {
+		return nil, err
+	}
+	items := (nHeadKV*nKV + 64) * 4
+	pk := push(uint32(nKV), uint32(capacity), uint32(nHeadKV))
+	if err := b.dispatch("kv_q4k_to_f16", []*buffer{kb, k16}, pk, groups(items)); err != nil {
+		return nil, err
+	}
+	if err := b.dispatch("kv_q4k_to_f16", []*buffer{vb, v16}, pk, groups(items)); err != nil {
+		return nil, err
+	}
+	out, err := b.newF32Buffer(qb.dims...)
+	if err != nil {
+		return nil, err
+	}
+	p := push(uint32(nQ), uint32(nHead), uint32(nHeadKV), uint32(nKV), qStart)
+	if err := b.dispatch("attention_flash_f16s_tc", []*buffer{q16, k16, v16, out}, p,
+		[3]uint32{uint32(nQ / 16), uint32(nHead), 1}); err != nil {
 		b.Free(out)
 		return nil, err
 	}

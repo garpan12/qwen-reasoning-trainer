@@ -1,0 +1,174 @@
+#version 450
+
+// Tensor-core prefill attention over fp16 Q (pre-scaled, q_to_f16) and fp16
+// K/V (kv_q4k_to_f16, [nHeadKV][nKV][256] + 64 zero rows). Dispatch
+// [nQ / 16, nHead]; one 128-invocation workgroup (4 subgroups) handles 16
+// queries of one query head. 64-key K and V tiles are copied into shared
+// memory as uvec4 (8 halves); pass 1 finds each query's softmax max m and sum
+// l, pass 2 accumulates O = (exp(S - m) / l) V. Requires headDim 256,
+// nQ % 16 == 0.
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) readonly  buffer Q { uvec4 d[]; } qbuf;
+layout(binding = 1) readonly  buffer K { uvec4 d[]; } kbuf;
+layout(binding = 2) readonly  buffer V { uvec4 d[]; } vbuf;
+layout(binding = 3) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint nQ;
+    uint nHead;
+    uint nHeadKV;
+    uint nKV;
+    uint qStart;
+} p;
+
+#define HD 256u
+#define QB 16u
+#define KT 64u
+#define RU 32u    // uvec4 per 256-dim fp16 row in global
+#define RS 33u    // uvec4 per row in shared (+8 halves pad)
+#define SF 68u
+#define PS 72u
+
+shared uvec4 Qs[QB * RS];
+shared uvec4 Ks[KT * RS];   // K tile, then V tile
+shared float Sf[QB * SF];
+shared float16_t Ps[QB * PS];
+shared float mrow[QB];
+shared float lrow[QB];
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MATA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MATB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+void loadTile(bool isV, uint kbase, uint t0) {
+    for (uint e = gl_LocalInvocationIndex; e < KT * RU; e += 128u) {
+        uint k = e / RU;
+        uint c = e - k * RU;
+        uint g = kbase + (t0 + k) * RU + c;   // rows past nKV hit the zero padding or the next head (masked)
+        Ks[k * RS + c] = isV ? vbuf.d[g] : kbuf.d[g];
+    }
+}
+
+void scoreTile(uint sg) {
+    ACC s = ACC(0.0);
+    for (uint kk = 0u; kk < HD; kk += 16u) {
+        MATA a;
+        MATB b;
+        coopMatLoad(a, Qs, kk / 8u, RS, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, Ks, (sg * 16u) * RS + kk / 8u, RS, gl_CooperativeMatrixLayoutColumnMajor);
+        s = coopMatMulAdd(a, b, s);
+    }
+    coopMatStore(s, Sf, sg * 16u, SF, gl_CooperativeMatrixLayoutRowMajor);
+}
+
+void main() {
+    uint qb = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    if (h >= p.nHead) {
+        return;
+    }
+    uint kvh = h / (p.nHead / p.nHeadKV);
+    uint tid = gl_LocalInvocationIndex;
+    uint sg = gl_SubgroupID;
+    uint q0 = qb * QB;
+    uint keyEnd = min(p.qStart + q0 + QB, p.nKV);
+    uint kbase = kvh * p.nKV * RU;
+    // Statistics lanes: row r of the tile, keys seg*8 .. seg*8+7.
+    uint r = tid >> 3u;
+    uint seg = tid & 7u;
+    uint qpos = p.qStart + q0 + r;
+
+    for (uint e = tid; e < QB * RU; e += 128u) {
+        uint qi = e / RU;
+        uint c = e - qi * RU;
+        Qs[qi * RS + c] = qbuf.d[((q0 + qi) * p.nHead + h) * RU + c];
+    }
+    float m = -1e30;
+    float l = 0.0;
+
+    // Pass 1: row max and sum (each 8-lane cluster owns one row).
+    for (uint t0 = 0u; t0 < keyEnd; t0 += KT) {
+        barrier();
+        loadTile(false, kbase, t0);
+        barrier();
+        scoreTile(sg);
+        barrier();
+        float tmax = -1e30;
+        for (uint c = seg * 8u; c < seg * 8u + 8u; c++) {
+            uint j = t0 + c;
+            if (j <= qpos && j < p.nKV) {
+                tmax = max(tmax, Sf[r * SF + c]);
+            }
+        }
+        float nm = max(m, subgroupClusteredMax(tmax, 8u));
+        float ps = 0.0;
+        for (uint c = seg * 8u; c < seg * 8u + 8u; c++) {
+            uint j = t0 + c;
+            if (j <= qpos && j < p.nKV) {
+                ps += exp(Sf[r * SF + c] - nm);
+            }
+        }
+        l = l * exp(m - nm) + subgroupClusteredAdd(ps, 8u);
+        m = nm;
+    }
+    if (seg == 0u) {
+        mrow[r] = m;
+        lrow[r] = l;
+    }
+
+    // Pass 2: O = sum (exp(S - m) / l) V; this subgroup owns dims sg*64 .. +63.
+    ACC o0 = ACC(0.0);
+    ACC o1 = ACC(0.0);
+    ACC o2 = ACC(0.0);
+    ACC o3 = ACC(0.0);
+    float invl = 1.0 / l;
+    for (uint t0 = 0u; t0 < keyEnd; t0 += KT) {
+        barrier();
+        loadTile(false, kbase, t0);
+        barrier();
+        scoreTile(sg);
+        barrier();
+        for (uint c = seg * 8u; c < seg * 8u + 8u; c++) {
+            uint j = t0 + c;
+            float pv = 0.0;
+            if (j <= qpos && j < p.nKV) {
+                pv = exp(Sf[r * SF + c] - m) * invl;
+            }
+            Ps[r * PS + c] = float16_t(pv);
+        }
+        barrier();
+        loadTile(true, kbase, t0);
+        barrier();
+        for (uint kk = 0u; kk < KT; kk += 16u) {
+            MATA a;
+            coopMatLoad(a, Ps, kk, PS, gl_CooperativeMatrixLayoutRowMajor);
+            MATB b0;
+            MATB b1;
+            MATB b2;
+            MATB b3;
+            uint vb0 = kk * RS + sg * 8u;   // dims sg*64 = 8 uvec4
+            coopMatLoad(b0, Ks, vb0, RS, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b1, Ks, vb0 + 2u, RS, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b2, Ks, vb0 + 4u, RS, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b3, Ks, vb0 + 6u, RS, gl_CooperativeMatrixLayoutRowMajor);
+            o0 = coopMatMulAdd(a, b0, o0);
+            o1 = coopMatMulAdd(a, b1, o1);
+            o2 = coopMatMulAdd(a, b2, o2);
+            o3 = coopMatMulAdd(a, b3, o3);
+        }
+    }
+    uint obase = (q0 * p.nHead + h) * HD + sg * 64u;
+    uint ostride = p.nHead * HD;
+    coopMatStore(o0, o, obase, ostride, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(o1, o, obase + 16u, ostride, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(o2, o, obase + 32u, ostride, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(o3, o, obase + 48u, ostride, gl_CooperativeMatrixLayoutRowMajor);
+}

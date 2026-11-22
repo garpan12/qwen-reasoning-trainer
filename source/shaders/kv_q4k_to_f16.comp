@@ -1,0 +1,75 @@
+#version 450
+
+// Decode keys [0, nKV) of a head-major Q4_K KV cache to packed fp16:
+// out[(kvh * nKV + tok) * 128 + i] holds dims 2i, 2i+1 (one 256-dim row per
+// Q4_K block). One invocation per (kvh, tok, 64-dim group). The 64 rows after
+// the last head are zeroed: attention fragment loads may run past nKV.
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly  buffer K { uvec4 d[]; } kbuf;
+layout(binding = 1) writeonly buffer O { uint o[]; };
+
+layout(push_constant) uniform P {
+    uint nKV;
+    uint capacity;
+    uint nHeadKV;
+} p;
+
+uint hb(uvec4 h, uint i) { return (h[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+void scaleMin(uvec4 h, uint s, out float dl, out float ml) {
+    vec2 dm = unpackHalf2x16(h.x);
+    uint sc, m;
+    if (s < 4u) {
+        sc = hb(h, 4u + s) & 63u;
+        m = hb(h, 8u + s) & 63u;
+    } else {
+        sc = (hb(h, 8u + s) & 0xFu) | ((hb(h, s) >> 6u) << 4u);
+        m = (hb(h, 8u + s) >> 4u) | ((hb(h, 4u + s) >> 6u) << 4u);
+    }
+    dl = dm.x * float(sc);
+    ml = dm.y * float(m);
+}
+
+void main() {
+    uint rows = p.nHeadKV * p.nKV;
+    uint total = (rows + 64u) * 4u;
+    uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint it = gl_GlobalInvocationID.x; it < total; it += stride) {
+        uint g = it & 3u;
+        uint row = it >> 2u;            // kvh * nKV + tok
+        if (row >= rows) {
+            for (uint i = 0u; i < 32u; i++) {
+                o[row * 128u + g * 32u + i] = 0u;
+            }
+            continue;
+        }
+        uint kvh = row / p.nKV;
+        uint tok = row - kvh * p.nKV;
+        uint b4 = (kvh * p.capacity + tok) * 9u;
+        uvec4 h = kbuf.d[b4];
+        uvec4 c0 = kbuf.d[b4 + 1u + g * 2u];
+        uvec4 c1 = kbuf.d[b4 + 2u + g * 2u];
+        float dl0, ml0, dl1, ml1;
+        scaleMin(h, g * 2u, dl0, ml0);
+        scaleMin(h, g * 2u + 1u, dl1, ml1);
+        uint ob = row * 128u + g * 32u;  // 64 dims = 32 packed pairs
+        for (uint i = 0u; i < 8u; i++) {
+            uint w = (i < 4u) ? c0[i] : c1[i - 4u];
+            float l0 = dl0 * float(w & 0xFu) - ml0;
+            float l1 = dl0 * float((w >> 8u) & 0xFu) - ml0;
+            float l2 = dl0 * float((w >> 16u) & 0xFu) - ml0;
+            float l3 = dl0 * float((w >> 24u) & 0xFu) - ml0;
+            float h0 = dl1 * float((w >> 4u) & 0xFu) - ml1;
+            float h1 = dl1 * float((w >> 12u) & 0xFu) - ml1;
+            float h2 = dl1 * float((w >> 20u) & 0xFu) - ml1;
+            float h3 = dl1 * float(w >> 28u) - ml1;
+            // low nibbles: dims g*64 + 4i..; high nibbles: g*64 + 32 + 4i..
+            o[ob + i * 2u] = packHalf2x16(vec2(l0, l1));
+            o[ob + i * 2u + 1u] = packHalf2x16(vec2(l2, l3));
+            o[ob + 16u + i * 2u] = packHalf2x16(vec2(h0, h1));
+            o[ob + 16u + i * 2u + 1u] = packHalf2x16(vec2(h2, h3));
+        }
+    }
+}
