@@ -63,43 +63,86 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 	if e.contextLen > 0 && capacity > e.contextLen {
 		capacity = e.contextLen
 	}
-	if _, ok := e.Backend.(qwen38.KVCacheBackend); ok {
-		need := EstimateKVBytes(e.Cfg, capacity, e.kvType)
-		if !e.reserveKV(need) {
-			return nil, fmt.Errorf("inference: KV cache request %s exceeds remaining budget %s",
-				FormatBytes(need), FormatBytes(e.kvBudget))
-		}
-		defer e.releaseKV(need)
+	// Prefix cache: a cached state must also fit later, longer turns, so it is
+	// sized for the whole context. split is where this prompt's reusable prefix
+	// ends (its last turn header); the state is snapshotted there.
+	usePrefix := prefixCacheEnabled() && e.contextLen > 0
+	split := 0
+	if usePrefix {
+		capacity = e.contextLen
+		split = e.prefixSplit(prompt)
 	}
 	var st *qwen38.State
-	err = compute.Run(e.Backend, func() error {
-		var stateErr error
-		st, stateErr = qwen38.NewStateWithOptions(e.Model.Cfg, qwen38.StateOptions{
-			Backend:       e.Backend,
-			KVType:        e.kvType,
-			Capacity:      capacity,
-			DeviceForward: e.Model.DeviceForwardEnabled(),
-		})
-		return stateErr
-	})
-	if err != nil {
-		return nil, err
+	var reserved uint64
+	reuse := 0
+	if usePrefix {
+		if c := e.takePrefix(prompt, split, capacity); c != nil {
+			st, reserved, reuse = c.st, c.reserved, len(c.tokens)
+		}
 	}
+	if st == nil {
+		if _, ok := e.Backend.(qwen38.KVCacheBackend); ok {
+			need := EstimateKVBytes(e.Cfg, capacity, e.kvType)
+			for !e.reserveKV(need) {
+				// Cached prefixes hold KV reservations; evict them before
+				// refusing the request.
+				if !usePrefix || !e.evictOldestPrefix() {
+					return nil, fmt.Errorf("inference: KV cache request %s exceeds remaining budget %s",
+						FormatBytes(need), FormatBytes(e.kvBudget))
+				}
+			}
+			reserved = need
+		}
+		err = compute.Run(e.Backend, func() error {
+			var stateErr error
+			st, stateErr = qwen38.NewStateWithOptions(e.Model.Cfg, qwen38.StateOptions{
+				Backend:       e.Backend,
+				KVType:        e.kvType,
+				Capacity:      capacity,
+				DeviceForward: e.Model.DeviceForwardEnabled(),
+			})
+			return stateErr
+		})
+		if err != nil {
+			e.releaseKV(reserved)
+			return nil, err
+		}
+	}
+	keepState := false
 	defer func() {
+		if keepState {
+			return
+		}
 		_ = compute.Run(e.Backend, func() error {
 			st.Free()
 			return nil
 		})
+		e.releaseKV(reserved)
 	}()
+	if usePrefix {
+		logPrefix(reuse, len(prompt), e.cachedPrefixes())
+	}
 	chunk := e.prefillChunk
 	if chunk <= 0 || chunk > len(prompt) {
 		chunk = len(prompt)
 	}
+	snapped := false
+	if usePrefix && split > 0 && reuse == split {
+		// The whole prefix came from the cache: the state is already at split.
+		if err := compute.Run(e.Backend, st.SpecSnapshot); err != nil {
+			return nil, err
+		}
+		snapped = true
+	}
 	var res *qwen38.ForwardResult
-	for start := 0; start < len(prompt); start += chunk {
+	for start := reuse; start < len(prompt); {
 		end := start + chunk
 		if end > len(prompt) {
 			end = len(prompt)
+		}
+		// Stop a chunk at the split so the state can be snapshotted there.
+		if usePrefix && !snapped && split > start && split < end {
+			end = split
 		}
 		positions := make([]int32, end-start)
 		for i := range positions {
@@ -115,6 +158,13 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 		if err != nil {
 			return nil, err
 		}
+		if usePrefix && !snapped && end == split {
+			if err := compute.Run(e.Backend, st.SpecSnapshot); err != nil {
+				return nil, err
+			}
+			snapped = true
+		}
+		start = end
 	}
 
 	parser := newStreamParser(req.EnableThinking, toolArgTypes(req.Tools), emit)
@@ -124,6 +174,14 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 
 	for i := 0; i < maxTokens; i++ {
 		if err := ctx.Err(); err != nil {
+			// The client went away (e.g. timed out during a long prefill).
+			// Keep the prefilled prefix so its retry doesn't start over.
+			if usePrefix && snapped {
+				if rerr := compute.Run(e.Backend, st.SpecRestore); rerr == nil {
+					e.putPrefix(&prefixEntry{st: st, tokens: append([]int32(nil), prompt[:split]...), capacity: capacity, reserved: reserved})
+					keepState = true
+				}
+			}
 			return nil, err
 		}
 		if e.contextLen > 0 && len(prompt)+len(generated) >= e.contextLen {
@@ -173,6 +231,14 @@ func (e *Engine) Chat(ctx context.Context, req ChatRequest, emit func(Delta) err
 		CompletionTokens: len(generated),
 	}
 	result.Tokens = append([]int32(nil), generated...)
+	if usePrefix && snapped {
+		// Rewind to the snapshot (the conversation before this turn) and keep
+		// the state for the next request.
+		if err := compute.Run(e.Backend, st.SpecRestore); err == nil {
+			e.putPrefix(&prefixEntry{st: st, tokens: append([]int32(nil), prompt[:split]...), capacity: capacity, reserved: reserved})
+			keepState = true
+		}
+	}
 	return &result, nil
 }
 

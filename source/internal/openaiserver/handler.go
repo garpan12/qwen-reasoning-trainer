@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cookiengineer/qwen-reasoning-trainer/internal/inference"
@@ -204,7 +206,10 @@ func (s *server) buildRequest(req *ChatCompletionRequest) (inference.ChatRequest
 		tools = nil
 	}
 
-	thinking := true
+	// QWEN38_NO_THINK=1 makes thinking default to off for requests that don't
+	// set it (e.g. opencode), so long agent sessions don't spend the output
+	// budget on reasoning. Explicit enable_thinking still wins.
+	thinking := os.Getenv("QWEN38_NO_THINK") != "1"
 	if req.EnableThinking != nil {
 		thinking = *req.EnableThinking
 	} else if v, ok := req.ChatTemplateKwargs["enable_thinking"].(bool); ok {
@@ -280,23 +285,36 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, id string, c
 	}
 	started := false
 	toolIndex := 0
+	// wmu serializes response writes between the generation callbacks and the
+	// keepalive goroutine.
+	var wmu sync.Mutex
+
+	start := func() error {
+		if started {
+			return nil
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		started = true
+		role := Chunk{
+			ID: id, Object: "chat.completion.chunk", Created: created, Model: s.opts.ModelID,
+			Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Role: "assistant"}}},
+		}
+		if err := writeSSE(w, role); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
 
 	send := func(delta ChunkDelta, finish *string, usage *Usage) error {
-		if !started {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-			w.Header().Set("X-Accel-Buffering", "no")
-			w.WriteHeader(http.StatusOK)
-			started = true
-			role := Chunk{
-				ID: id, Object: "chat.completion.chunk", Created: created, Model: s.opts.ModelID,
-				Choices: []ChunkChoice{{Index: 0, Delta: ChunkDelta{Role: "assistant"}}},
-			}
-			if err := writeSSE(w, role); err != nil {
-				return err
-			}
-			flusher.Flush()
+		wmu.Lock()
+		defer wmu.Unlock()
+		if err := start(); err != nil {
+			return err
 		}
 		chunk := Chunk{
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: s.opts.ModelID,
@@ -332,7 +350,37 @@ func (s *server) streamChat(w http.ResponseWriter, r *http.Request, id string, c
 		return nil
 	}
 
+	// Keepalive: a long prompt can take minutes to prefill before the first
+	// token (or the request may wait behind another one). Start the stream
+	// right away and send an SSE comment every 10 s so clients and tunnels see
+	// a live connection.
+	stopKeepalive := make(chan struct{})
+	var keepaliveDone sync.WaitGroup
+	keepaliveDone.Add(1)
+	go func() {
+		defer keepaliveDone.Done()
+		tick := time.NewTicker(10 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stopKeepalive:
+				return
+			case <-r.Context().Done():
+				return
+			case <-tick.C:
+				wmu.Lock()
+				if start() == nil {
+					if _, err := w.Write([]byte(": keepalive\n\n")); err == nil {
+						flusher.Flush()
+					}
+				}
+				wmu.Unlock()
+			}
+		}
+	}()
 	res, err := s.gen.Chat(r.Context(), req, emit)
+	close(stopKeepalive)
+	keepaliveDone.Wait()
 	if err != nil {
 		if !started {
 			s.writeError(w, http.StatusInternalServerError, "server_error", "generation_failed", err.Error())

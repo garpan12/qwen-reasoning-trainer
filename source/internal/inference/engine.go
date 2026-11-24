@@ -61,6 +61,13 @@ type Engine struct {
 	prefillChunk int
 	imEnd        int32
 	hasImEnd     bool
+	imStart      int32
+	hasImStart   bool
+
+	// prefixes are cached request states, most recently used first (see
+	// prefixEntry).
+	prefixMu sync.Mutex
+	prefixes []*prefixEntry
 
 	kvBudget uint64
 	kvLimit  bool
@@ -181,6 +188,9 @@ func Load(opt LoadOptions) (*Engine, error) {
 	if id, ok := vocab.SpecialID("<|im_end|>"); ok {
 		e.imEnd, e.hasImEnd = id, true
 	}
+	if id, ok := vocab.SpecialID("<|im_start|>"); ok {
+		e.imStart, e.hasImStart = id, true
+	}
 	return e, nil
 }
 
@@ -246,6 +256,7 @@ func (e *Engine) Close() error {
 	e.close.Do(func() {
 		e.life.Lock()
 		e.closed = true
+		e.dropAllPrefixes()
 		if e.Model != nil {
 			e.Model.FreeDevice()
 		}
